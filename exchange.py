@@ -2,6 +2,7 @@ from binance.client import Client
 from binance.enums import *
 
 from collections import deque
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import pandas as pd
 import re
 import threading
@@ -1168,6 +1169,32 @@ def _cancel_algo_order(symbol, algo_id):
     )
 
 
+def cancel_algo_order(symbol, algo_id):
+    if not algo_id:
+        return True
+
+    try:
+        _cancel_algo_order(symbol, algo_id)
+        log_info(f"{symbol} algo order cancelled | ALGO_ID={algo_id}")
+        return True
+
+    except Exception as e:
+        message = str(e).lower()
+
+        if (
+            "unknown order" in message or
+            "order does not exist" in message or
+            "not found" in message
+        ):
+            return True
+
+        log_warning(
+            f"{symbol} algo order cancel failed | "
+            f"ALGO_ID={algo_id} | ERROR={e}"
+        )
+        return False
+
+
 def _normalise_algo_orders(response):
     if isinstance(response, dict):
         return response.get("orders") or response.get("data") or []
@@ -1361,6 +1388,66 @@ def get_price_precision(symbol):
             return int(s['pricePrecision'])
 
     return 4
+
+
+def get_symbol_quantity_rules(symbol):
+    try:
+        for item in get_exchange_info().get("symbols", []):
+            if item.get("symbol") != symbol:
+                continue
+
+            filters = {
+                entry.get("filterType"): entry
+                for entry in item.get("filters", [])
+            }
+            lot_size = (
+                filters.get("MARKET_LOT_SIZE") or
+                filters.get("LOT_SIZE") or
+                {}
+            )
+            return {
+                "step_size": lot_size.get("stepSize", "1"),
+                "min_qty": lot_size.get("minQty", "0"),
+                "max_qty": lot_size.get("maxQty", "0"),
+                "precision": int(item.get("quantityPrecision", 3)),
+            }
+    except Exception as e:
+        log_warning(f"{symbol} quantity rule lookup warning: {e}")
+
+    precision = get_symbol_precision(symbol)
+    return {
+        "step_size": str(10 ** -precision),
+        "min_qty": "0",
+        "max_qty": "0",
+        "precision": precision,
+    }
+
+
+def normalize_order_quantity(symbol, quantity, round_down=True):
+    try:
+        rules = get_symbol_quantity_rules(symbol)
+        value = Decimal(str(abs(float(quantity))))
+        step = Decimal(str(rules.get("step_size") or "1"))
+        min_qty = Decimal(str(rules.get("min_qty") or "0"))
+        max_qty = Decimal(str(rules.get("max_qty") or "0"))
+
+        if step > 0 and round_down:
+            value = (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+        if value < min_qty or value <= 0:
+            return 0.0
+
+        if max_qty > 0:
+            value = min(value, max_qty)
+
+        precision = max(int(rules.get("precision", 3)), 0)
+        quantum = Decimal("1").scaleb(-precision)
+        value = value.quantize(quantum, rounding=ROUND_DOWN)
+        return float(value)
+
+    except (InvalidOperation, TypeError, ValueError) as e:
+        log_warning(f"{symbol} quantity normalization warning: {e}")
+        return 0.0
 
 
 # =========================
@@ -1659,6 +1746,116 @@ def place_algo_order(**params):
     )
 
 
+def _accepted_order_id(order):
+    order = order or {}
+    status = str(
+        order.get("algoStatus") or order.get("status") or ""
+    ).upper()
+
+    if status in {"REJECTED", "EXPIRED", "CANCELED", "CANCELLED", "FAILED"}:
+        return ""
+
+    return order.get("algoId") or order.get("orderId") or ""
+
+
+def _position_close_params(position_side=None):
+    position_side = str(position_side or "").upper()
+
+    if position_side in ("LONG", "SHORT"):
+        return {"positionSide": position_side}
+
+    return {}
+
+
+def place_partial_take_profit(
+    symbol,
+    side,
+    total_quantity,
+    close_pct,
+    trigger_price,
+    position_side=None,
+):
+    close_pct = min(max(float(close_pct), 0), 100)
+
+    if close_pct <= 0 or close_pct >= 100:
+        return None, 0.0
+
+    total_quantity = normalize_order_quantity(symbol, total_quantity)
+    partial_quantity = normalize_order_quantity(
+        symbol,
+        total_quantity * close_pct / 100,
+    )
+    remaining_quantity = normalize_order_quantity(
+        symbol,
+        total_quantity - partial_quantity,
+    )
+
+    if (
+        total_quantity <= 0 or
+        partial_quantity <= 0 or
+        partial_quantity >= total_quantity or
+        remaining_quantity <= 0
+    ):
+        log_warning(
+            f"{symbol} partial TP unavailable | TOTAL={total_quantity} | "
+            f"PARTIAL={partial_quantity} | REMAINING={remaining_quantity}"
+        )
+        return None, 0.0
+
+    close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+    params = {
+        "algoType": "CONDITIONAL",
+        "symbol": symbol,
+        "side": close_side,
+        "type": "TAKE_PROFIT_MARKET",
+        "triggerPrice": trigger_price,
+        "quantity": partial_quantity,
+        "workingType": "MARK_PRICE",
+        "priceProtect": "TRUE",
+    }
+    close_params = _position_close_params(position_side)
+
+    if close_params:
+        params.update(close_params)
+    else:
+        params["reduceOnly"] = "true"
+
+    try:
+        order = place_algo_order(**params)
+    except Exception as e:
+        if close_params or not _is_position_side_error(e):
+            raise
+
+        inferred_position_side = "LONG" if side == SIDE_BUY else "SHORT"
+        params.pop("reduceOnly", None)
+        params["positionSide"] = inferred_position_side
+        order = place_algo_order(**params)
+
+    return order, partial_quantity
+
+
+def place_close_position_protection(
+    symbol,
+    side,
+    order_type,
+    trigger_price,
+    position_side=None,
+):
+    close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+    params = {
+        "algoType": "CONDITIONAL",
+        "symbol": symbol,
+        "side": close_side,
+        "type": order_type,
+        "triggerPrice": trigger_price,
+        "closePosition": "true",
+        "workingType": "MARK_PRICE",
+        "priceProtect": "TRUE",
+    }
+    params.update(_position_close_params(position_side))
+    return place_algo_order(**params)
+
+
 def place_stop_loss_only(
     symbol,
     side,
@@ -1755,6 +1952,8 @@ def place_tp_sl(
     roi_override=None,
     roi_mode_label=None,
     signal_type=None,
+    enable_multi_tp=False,
+    position_side=None,
     return_details=False
 ):
     signal_type = str(signal_type or "").upper().strip()
@@ -1773,6 +1972,10 @@ def place_tp_sl(
         "sl_created": False,
         "sl_order": None,
         "tp_order": None,
+        "multi_tp_active": False,
+        "tp1_close_pct": None,
+        "tp1_quantity": None,
+        "tp1_base_quantity": quantity,
     }
 
     try:
@@ -1791,7 +1994,6 @@ def place_tp_sl(
                 signal_type,
                 precision
             )
-            close_side = SIDE_SELL
 
         # ================= SELL =================
         else:
@@ -1802,7 +2004,6 @@ def place_tp_sl(
                 signal_type,
                 precision
             )
-            close_side = SIDE_BUY
 
         reversal_tp = signal_type == "REVERSAL"
         reversal_max_roi = max(
@@ -1967,16 +2168,60 @@ def place_tp_sl(
         )
 
         # TAKE PROFIT
-        tp_order = place_algo_order(
-            algoType="CONDITIONAL",
-            symbol=symbol,
-            side=close_side,
-            type="TAKE_PROFIT_MARKET",
-            triggerPrice=tp_price,
-            closePosition="true",
-            workingType="MARK_PRICE",
-            priceProtect="TRUE"
+        tp_order = None
+        partial_quantity = 0.0
+        close_pct = float(
+            getattr(config, "TP1_CLOSE_POSITION_PCT", 50)
         )
+
+        if enable_multi_tp and getattr(config, "MULTI_TP_ENABLED", False):
+            try:
+                tp_order, partial_quantity = place_partial_take_profit(
+                    symbol,
+                    side,
+                    quantity,
+                    close_pct,
+                    tp_price,
+                    position_side=position_side,
+                )
+            except Exception as e:
+                details["multi_tp_fallback_reason"] = str(e)
+                log_warning(
+                    f"{symbol} partial TP placement failed; "
+                    f"using full-position TP | ERROR={e}"
+                )
+                tp_order = None
+                partial_quantity = 0.0
+
+        if tp_order and _accepted_order_id(tp_order):
+            details.update({
+                "multi_tp_active": True,
+                "tp1_close_pct": close_pct,
+                "tp1_quantity": partial_quantity,
+            })
+            log_info(
+                f"{symbol} TP1 partial order created | "
+                f"CLOSE_PCT={close_pct}% | QTY={partial_quantity}"
+            )
+        else:
+            if enable_multi_tp and getattr(config, "MULTI_TP_ENABLED", False):
+                log_warning(
+                    f"{symbol} partial TP unavailable; using full-position TP"
+                )
+
+            tp_order = place_close_position_protection(
+                symbol,
+                side,
+                "TAKE_PROFIT_MARKET",
+                tp_price,
+                position_side=position_side,
+            )
+
+        if not _accepted_order_id(tp_order):
+            raise RuntimeError(
+                f"{symbol} TP order was not accepted | RESPONSE={tp_order}"
+            )
+
         log_info(
             f"{symbol} TP order response | "
             f"ALGO_ID={tp_order.get('algoId')} | "
@@ -1990,20 +2235,16 @@ def place_tp_sl(
             time.sleep(config.PROTECTION_ORDER_DELAY_SECONDS)
 
             # STOP LOSS
-            sl_order = place_algo_order(
-                algoType="CONDITIONAL",
-                symbol=symbol,
-                side=close_side,
-                type="STOP_MARKET",
-                triggerPrice=sl_price,
-                closePosition="true",
-                workingType="MARK_PRICE",
-                priceProtect="TRUE"
+            sl_order = place_close_position_protection(
+                symbol,
+                side,
+                "STOP_MARKET",
+                sl_price,
+                position_side=position_side,
             )
             details["sl_order"] = sl_order
             details["sl_created"] = bool(
-                sl_order and
-                (sl_order.get("algoId") or sl_order.get("orderId"))
+                _accepted_order_id(sl_order)
             )
             log_info(
                 f"{symbol} SL order response | "
@@ -2022,6 +2263,25 @@ def place_tp_sl(
         return details if return_details else True
 
     except Exception as e:
+        tp_order = details.get("tp_order") or {}
+        tp_order_id = _accepted_order_id(tp_order)
+
+        if tp_order_id:
+            cleanup_ok = cancel_algo_order(symbol, tp_order_id)
+            details["protection_cleanup_failed"] = not cleanup_ok
+
+            if cleanup_ok:
+                details["tp_order"] = None
+                details["multi_tp_active"] = False
+                details["tp1_close_pct"] = None
+                details["tp1_quantity"] = None
+            else:
+                details["uncancelled_tp_order_id"] = tp_order_id
+                log_error(
+                    f"{symbol} TP cleanup failed after protection error; "
+                    "automatic retry must remain blocked"
+                )
+
         log_error(f"{symbol} TP/SL error: {e}")
         return details if return_details else False
 

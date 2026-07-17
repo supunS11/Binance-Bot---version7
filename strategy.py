@@ -3161,6 +3161,215 @@ def _reversal_recovery_score(side, confirm_df, entry_df, momentum_context, smc_o
     }
 
 
+def _adaptive_dca_atr_multiplier(dca_level):
+    multipliers = list(
+        getattr(config, "DCA_ADAPTIVE_ATR_MULTIPLIERS", []) or []
+    )
+
+    if not multipliers:
+        return 1.0
+
+    index = min(max(int(dca_level or 1) - 1, 0), len(multipliers) - 1)
+    return max(_safe_float(multipliers[index], 1.0), 0)
+
+
+def _adaptive_dca_trend_thesis(side, trend_df, trade_type):
+    context = {
+        "valid": True,
+        "reason": "DCA_ADAPTIVE_THESIS_OK",
+        "opposing_alignment": False,
+        "ema200_broken": False,
+        "momentum_opposing": False,
+        "structure_break": False,
+        "adx": 0.0,
+    }
+
+    if (
+        trade_type != "TREND" or
+        not getattr(
+            config,
+            "DCA_ADAPTIVE_BLOCK_TREND_THESIS_INVALIDATION",
+            True,
+        )
+    ):
+        context["reason"] = "DCA_ADAPTIVE_THESIS_NOT_REQUIRED"
+        return context
+
+    trend = latest_closed(trend_df)
+    previous = previous_closed(trend_df)
+    adx = _safe_float(trend.get("adx"))
+    min_adx = get_config_float("DCA_ADAPTIVE_THESIS_MIN_ADX", 18)
+
+    if side == "BUY":
+        opposing_alignment = (
+            trend["ema20"] < trend["ema50"] < trend["ema200"]
+        )
+        ema200_broken = trend["close"] < trend["ema200"]
+        momentum_opposing = trend["macd"] < trend["macd_signal"]
+        structure_break = trend["close"] < previous["low"]
+    else:
+        opposing_alignment = (
+            trend["ema20"] > trend["ema50"] > trend["ema200"]
+        )
+        ema200_broken = trend["close"] > trend["ema200"]
+        momentum_opposing = trend["macd"] > trend["macd_signal"]
+        structure_break = trend["close"] > previous["high"]
+
+    invalid = bool(
+        adx >= min_adx and
+        opposing_alignment and
+        ema200_broken and
+        (momentum_opposing or structure_break)
+    )
+    context.update({
+        "valid": not invalid,
+        "reason": (
+            "DCA_ADAPTIVE_1D_THESIS_INVALIDATED"
+            if invalid
+            else "DCA_ADAPTIVE_THESIS_OK"
+        ),
+        "opposing_alignment": bool(opposing_alignment),
+        "ema200_broken": bool(ema200_broken),
+        "momentum_opposing": bool(momentum_opposing),
+        "structure_break": bool(structure_break),
+        "adx": round(adx, 2),
+        "min_adx": min_adx,
+    })
+    return context
+
+
+def validate_adaptive_dca_trigger(
+    side,
+    current_price,
+    trend_df,
+    confirm_df,
+    dca_level,
+    adverse_roi,
+    trigger_roi,
+    spacing_anchor_price,
+    confirmation_type,
+    recovery,
+    structure_ok,
+    structure_info,
+):
+    mode = str(getattr(config, "DCA_TRIGGER_MODE", "static_roi") or "").lower()
+    info = {
+        "enabled": mode == "adaptive_hybrid",
+        "reason": "DCA_ADAPTIVE_DISABLED",
+        "dca_level": int(dca_level or 1),
+        "adverse_roi": round(_safe_float(adverse_roi), 2),
+        "trigger_roi": round(_safe_float(trigger_roi), 2),
+    }
+
+    if mode != "adaptive_hybrid":
+        return True, info
+
+    current_price = _safe_float(current_price)
+    spacing_anchor_price = _safe_float(spacing_anchor_price)
+    trigger_roi = _safe_float(trigger_roi)
+    adverse_roi = _safe_float(adverse_roi)
+    max_adverse_roi = max(
+        get_config_float("DCA_MAX_ADVERSE_ROI", 0),
+        0,
+    )
+
+    if current_price <= 0 or spacing_anchor_price <= 0:
+        info["reason"] = "DCA_ADAPTIVE_INVALID_PRICE"
+        return False, info
+
+    if adverse_roi < trigger_roi:
+        info["reason"] = "DCA_ADAPTIVE_ROI_FLOOR_NOT_REACHED"
+        return False, info
+
+    if max_adverse_roi > 0 and adverse_roi > max_adverse_roi:
+        info.update({
+            "reason": "DCA_ADAPTIVE_MAX_RISK_EXCEEDED",
+            "max_adverse_roi": max_adverse_roi,
+        })
+        return False, info
+
+    confirm = latest_closed(confirm_df)
+    atr = max(_safe_float(confirm.get("atr")), 0)
+    multiplier = _adaptive_dca_atr_multiplier(dca_level)
+    directional_gap = (
+        spacing_anchor_price - current_price
+        if side == "BUY"
+        else current_price - spacing_anchor_price
+    )
+    gap_atr = directional_gap / atr if atr > 0 else 0
+    info.update({
+        "spacing_anchor_price": round(spacing_anchor_price, 10),
+        "atr": round(atr, 10),
+        "atr_multiplier": multiplier,
+        "gap_atr": round(gap_atr, 2),
+    })
+
+    if atr <= 0:
+        info["reason"] = "DCA_ADAPTIVE_ATR_UNAVAILABLE"
+        return False, info
+
+    if directional_gap <= 0 or gap_atr < multiplier:
+        info["reason"] = "DCA_ADAPTIVE_ATR_SPACING_NOT_REACHED"
+        return False, info
+
+    thesis = _adaptive_dca_trend_thesis(
+        side,
+        trend_df,
+        str(confirmation_type or "").upper(),
+    )
+    info["thesis"] = thesis
+
+    if not thesis.get("valid"):
+        info["reason"] = thesis.get(
+            "reason",
+            "DCA_ADAPTIVE_THESIS_INVALIDATED",
+        )
+        return False, info
+
+    if (
+        getattr(config, "DCA_ADAPTIVE_REQUIRE_STRUCTURE", True) and
+        not structure_ok
+    ):
+        info.update({
+            "reason": structure_info.get(
+                "reason",
+                "DCA_ADAPTIVE_STRUCTURE_REQUIRED",
+            ),
+            "structure": structure_info,
+        })
+        return False, info
+
+    route = str(confirmation_type or "").upper()
+    base_recovery = (
+        get_config_float("DCA_ADAPTIVE_REVERSAL_MIN_RECOVERY_SCORE", 3.5)
+        if route == "REVERSAL"
+        else get_config_float("DCA_ADAPTIVE_MIN_RECOVERY_SCORE", 2.5)
+    )
+    recovery_step = max(
+        get_config_float("DCA_ADAPTIVE_RECOVERY_STEP_PER_LEVEL", 0.25),
+        0,
+    )
+    required_recovery = base_recovery + (
+        max(int(dca_level or 1) - 1, 0) * recovery_step
+    )
+    recovery_score = _safe_float((recovery or {}).get("score"))
+    info.update({
+        "recovery_score": round(recovery_score, 2),
+        "required_recovery": round(required_recovery, 2),
+        "structure": structure_info,
+    })
+
+    if (
+        getattr(config, "DCA_ADAPTIVE_REQUIRE_RECOVERY", True) and
+        recovery_score < required_recovery
+    ):
+        info["reason"] = "DCA_ADAPTIVE_RECOVERY_NOT_CONFIRMED"
+        return False, info
+
+    info["reason"] = "DCA_ADAPTIVE_TRIGGER_OK"
+    return True, info
+
+
 def validate_reversal_invalidation(
     side,
     trend_df,
@@ -3254,8 +3463,18 @@ def validate_dca_continuation_guard(
     dca_level=1,
     adverse_roi=0,
     position_adverse_roi=0,
+    trigger_roi=None,
+    spacing_anchor_price=None,
 ):
-    if not getattr(config, "DCA_STRICT_GUARD_ENABLED", True):
+    strict_enabled = bool(
+        getattr(config, "DCA_STRICT_GUARD_ENABLED", True)
+    )
+    adaptive_enabled = (
+        str(getattr(config, "DCA_TRIGGER_MODE", "static_roi")).lower() ==
+        "adaptive_hybrid"
+    )
+
+    if not strict_enabled and not adaptive_enabled:
         return True, {"reason": "DCA_STRICT_GUARD_DISABLED"}
 
     trade_type = str(confirmation_type or "").upper()
@@ -3263,6 +3482,7 @@ def validate_dca_continuation_guard(
     if (
         getattr(config, "DCA_STRICT_GUARD_APPLY_TO_REVERSAL_ONLY", False)
         and trade_type != "REVERSAL"
+        and not adaptive_enabled
     ):
         return True, {"reason": "DCA_STRICT_GUARD_NON_REVERSAL_SKIPPED"}
 
@@ -3343,6 +3563,29 @@ def validate_dca_continuation_guard(
         "min_recovery": min_recovery,
         "structure": structure_info,
     }
+
+    adaptive_ok, adaptive_info = validate_adaptive_dca_trigger(
+        side,
+        current_price,
+        trend_df,
+        confirm_df,
+        dca_level,
+        adverse_roi,
+        adverse_roi if trigger_roi is None else trigger_roi,
+        avg_entry if spacing_anchor_price is None else spacing_anchor_price,
+        trade_type,
+        recovery,
+        structure_ok,
+        structure_info,
+    )
+    info["adaptive"] = adaptive_info
+
+    if not adaptive_ok:
+        info["reason"] = adaptive_info.get(
+            "reason",
+            "DCA_ADAPTIVE_TRIGGER_BLOCKED",
+        )
+        return False, info
 
     if trade_type == "REVERSAL" and int(dca_level or 1) <= 1 and recovery_score < min_recovery:
         info["reason"] = (
@@ -3657,24 +3900,36 @@ def _reversal_futures_confirmation_context(
     }
 
 
-def evaluate_reversal_profit_protection(
+def evaluate_route_profit_protection(
     side,
     avg_entry,
     current_price,
     peak_roi=0,
     leverage=None,
+    confirmation_type="REVERSAL",
 ):
+    route = (
+        "REVERSAL"
+        if str(confirmation_type or "").upper() == "REVERSAL"
+        else "TREND"
+    )
+    prefix = f"{route}_PROFIT_PROTECTION"
     enabled = bool(
-        getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True)
+        getattr(
+            config,
+            f"{prefix}_ENABLED",
+            route == "REVERSAL",
+        )
     )
     info = {
+        "route": route,
         "enabled": enabled,
         "armed": False,
         "should_exit": False,
         "current_roi": 0.0,
         "peak_roi": max(_safe_float(peak_roi), 0),
         "floor_roi": 0.0,
-        "reason": "REVERSAL_PROFIT_PROTECTION_DISABLED",
+        "reason": f"{prefix}_DISABLED",
     }
 
     if not enabled:
@@ -3688,7 +3943,7 @@ def evaluate_reversal_profit_protection(
     )
 
     if side not in ("BUY", "SELL") or avg_entry <= 0 or current_price <= 0:
-        info["reason"] = "REVERSAL_PROFIT_PROTECTION_INVALID_PRICE"
+        info["reason"] = f"{prefix}_INVALID_PRICE"
         return info
 
     if side == "BUY":
@@ -3702,18 +3957,24 @@ def evaluate_reversal_profit_protection(
 
     peak_roi = max(_safe_float(peak_roi), current_roi, 0)
     trigger_roi = max(
-        get_config_float("REVERSAL_PROFIT_PROTECTION_TRIGGER_ROI", 12),
+        get_config_float(
+            f"{prefix}_TRIGGER_ROI",
+            12 if route == "REVERSAL" else 15,
+        ),
         0,
     )
     lock_roi = max(
-        get_config_float("REVERSAL_PROFIT_PROTECTION_LOCK_ROI", 3),
+        get_config_float(
+            f"{prefix}_LOCK_ROI",
+            3 if route == "REVERSAL" else 5,
+        ),
         0,
     )
     retrace_pct = min(
         max(
             get_config_float(
-                "REVERSAL_PROFIT_PROTECTION_RETRACE_PCT",
-                50,
+                f"{prefix}_RETRACE_PCT",
+                50 if route == "REVERSAL" else 45,
             ),
             0,
         ),
@@ -3737,16 +3998,50 @@ def evaluate_reversal_profit_protection(
         "lock_roi": lock_roi,
         "retrace_pct": retrace_pct,
         "reason": (
-            "REVERSAL_PROFIT_RETRACE_EXIT"
+            f"{route}_PROFIT_RETRACE_EXIT"
             if should_exit
             else (
-                "REVERSAL_PROFIT_PROTECTION_ARMED"
+                f"{prefix}_ARMED"
                 if armed
-                else "REVERSAL_PROFIT_TRIGGER_NOT_REACHED"
+                else f"{route}_PROFIT_TRIGGER_NOT_REACHED"
             )
         ),
     })
     return info
+
+
+def evaluate_reversal_profit_protection(
+    side,
+    avg_entry,
+    current_price,
+    peak_roi=0,
+    leverage=None,
+):
+    return evaluate_route_profit_protection(
+        side,
+        avg_entry,
+        current_price,
+        peak_roi=peak_roi,
+        leverage=leverage,
+        confirmation_type="REVERSAL",
+    )
+
+
+def evaluate_trend_profit_protection(
+    side,
+    avg_entry,
+    current_price,
+    peak_roi=0,
+    leverage=None,
+):
+    return evaluate_route_profit_protection(
+        side,
+        avg_entry,
+        current_price,
+        peak_roi=peak_roi,
+        leverage=leverage,
+        confirmation_type="TREND",
+    )
 
 
 def _refresh_side_decision(side_data):

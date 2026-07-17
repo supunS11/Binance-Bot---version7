@@ -12,10 +12,11 @@ import requests
 
 import config
 from indicators import apply_indicators
+from multi_tp import calculate_runner_stop
 from strategy import (
     analyze_signal,
     evaluate_route_early_invalidation,
-    evaluate_reversal_profit_protection,
+    evaluate_route_profit_protection,
     validate_adverse_zone_level,
     validate_dca_continuation_guard,
     validate_entry_profit_room,
@@ -633,7 +634,7 @@ def position_average_entry(fills):
     return sum(item["qty"] * item["price"] for item in fills) / qty
 
 
-def calculate_trade_pnl(side, fills, exit_price):
+def calculate_trade_pnl(side, fills, exit_price, partial_exits=None):
     fee_rate = float(getattr(config, "BACKTEST_FEE_RATE", 0.0004))
     gross = 0.0
     entry_fees = 0.0
@@ -650,11 +651,44 @@ def calculate_trade_pnl(side, fills, exit_price):
         entry_fees += qty * fill["price"] * fee_rate
         exit_fees += qty * exit_price * fee_rate
 
+    for partial in partial_exits or []:
+        qty = float(partial["qty"])
+        entry = float(partial["entry_price"])
+        partial_exit = float(partial["exit_price"])
+
+        if side == "BUY":
+            gross += qty * (partial_exit - entry)
+        else:
+            gross += qty * (entry - partial_exit)
+
+        entry_fees += qty * entry * fee_rate
+        exit_fees += qty * partial_exit * fee_rate
+
     fees = entry_fees + exit_fees
     margin = sum(item["margin"] for item in fills)
     net = gross - fees
     roi = (net / margin * 100) if margin > 0 else 0.0
     return gross, fees, net, roi
+
+
+def realize_partial_exit(fills, close_pct, exit_price):
+    fraction = min(max(float(close_pct) / 100, 0), 1)
+    partial_exits = []
+
+    if fraction <= 0 or fraction >= 1:
+        return partial_exits
+
+    for fill in fills:
+        quantity = float(fill["qty"])
+        close_quantity = quantity * fraction
+        fill["qty"] = quantity - close_quantity
+        partial_exits.append({
+            "qty": close_quantity,
+            "entry_price": float(fill["price"]),
+            "exit_price": float(exit_price),
+        })
+
+    return partial_exits
 
 
 def compute_take_profit(
@@ -716,6 +750,48 @@ def compute_take_profit(
         roi = min(roi, reversal_max_roi)
 
     return roi_to_price(side, avg_entry, roi), f"FALLBACK_ROI_{roi}%"
+
+
+def compute_runner_take_profit(
+    side,
+    basis_price,
+    trend_df,
+    confirm_df,
+    confirmation_type=None,
+):
+    ok, target = validate_structure_take_profit(
+        side,
+        basis_price,
+        trend_df,
+        confirm_df,
+        leverage=config.LEVERAGE,
+    )
+    reversal = str(confirmation_type or "").upper() == "REVERSAL"
+    reversal_max_roi = max(
+        float(getattr(config, "REVERSAL_TP_MAX_ROI", 45)),
+        0,
+    )
+
+    if ok and target.get("target_price"):
+        target_roi = float(target.get("target_roi") or 0)
+
+        if reversal and reversal_max_roi > 0 and target_roi > reversal_max_roi:
+            return (
+                roi_to_price(side, basis_price, reversal_max_roi),
+                f"TP2_REVERSAL_STRUCTURE_CAPPED_{reversal_max_roi}%",
+            )
+
+        return float(target["target_price"]), f"TP2_STRUCTURE_{target['source']}"
+
+    fallback_roi = max(float(getattr(config, "TP2_FALLBACK_ROI", 35)), 0)
+
+    if reversal and reversal_max_roi > 0:
+        fallback_roi = min(fallback_roi, reversal_max_roi)
+
+    return (
+        roi_to_price(side, basis_price, fallback_roi),
+        f"TP2_FALLBACK_ROI_{fallback_roi}%",
+    )
 
 
 def candle_hits_tp(side, candle, tp_price):
@@ -785,6 +861,20 @@ def simulate_trade(
         decision_confirm,
         confirmation_type=confirmation_type,
     )
+    tp1_close_pct = float(getattr(config, "TP1_CLOSE_POSITION_PCT", 50))
+    multi_tp_enabled = bool(
+        getattr(config, "BACKTEST_MULTI_TP_ENABLED", False) and
+        getattr(config, "MULTI_TP_ENABLED", False) and
+        0 < tp1_close_pct < 100
+    )
+    tp1_price = float(tp_price)
+    tp1_mode = tp_mode
+    tp1_hit = False
+    tp1_exit_price = None
+    tp1_time = None
+    tp2_price = None
+    tp2_mode = ""
+    partial_exits = []
     sl_price, sl_mode = compute_stop_loss(
         side,
         avg_entry,
@@ -793,7 +883,8 @@ def simulate_trade(
     )
     max_seen_adverse_roi = 0.0
     max_seen_favorable_roi = 0.0
-    reversal_profit_floor_roi = 0.0
+    profit_protection_peak_roi = 0.0
+    profit_protection_floor_roi = 0.0
     exit_candle = None
     exit_reason = "OPEN_AT_DATA_END"
     exit_price = None
@@ -899,20 +990,47 @@ def simulate_trade(
                     )
                     break
 
-        while True:
+        while not tp1_hit:
             trigger_roi = dca_trigger_roi(dca_count)
             next_margin = dca_margin(dca_count)
 
             if trigger_roi is None or next_margin <= 0:
                 break
 
-            anchor_price = fills[-1]["price"]
-            trigger_price = dca_trigger_price(side, anchor_price, trigger_roi)
+            cooldown_ms = max(
+                int(getattr(config, "DCA_MIN_SECONDS_BETWEEN_ORDERS", 0)),
+                0,
+            ) * 1000
+
+            if cooldown_ms and candle_time - int(fills[-1]["time"]) < cooldown_ms:
+                break
+
+            max_adverse_roi = max(
+                float(getattr(config, "DCA_MAX_ADVERSE_ROI", 0)),
+                0,
+            )
+
+            if max_adverse_roi and trigger_roi > max_adverse_roi:
+                dca_blocked_count += 1
+                last_dca_block_reason = "DCA_MAX_RISK_EXCEEDED"
+                break
+
+            trigger_anchor_price = fills[0]["price"]
+            spacing_anchor_price = fills[-1]["price"]
+            trigger_price = dca_trigger_price(
+                side,
+                trigger_anchor_price,
+                trigger_roi,
+            )
 
             if not candle_hits_dca(side, candle, trigger_price):
                 break
 
-            if getattr(config, "DCA_STRICT_GUARD_ENABLED", True):
+            if (
+                getattr(config, "DCA_STRICT_GUARD_ENABLED", True) or
+                getattr(config, "DCA_TRIGGER_MODE", "static_roi") ==
+                "adaptive_hybrid"
+            ):
                 trend_slice = closed_slice(
                     frames["trend"].indicators,
                     candle_time,
@@ -947,6 +1065,8 @@ def simulate_trade(
                     dca_level=dca_count + 1,
                     adverse_roi=trigger_roi,
                     position_adverse_roi=round(float(position_adverse_roi), 2),
+                    trigger_roi=trigger_roi,
+                    spacing_anchor_price=spacing_anchor_price,
                 )
 
                 if not guard_ok:
@@ -966,6 +1086,8 @@ def simulate_trade(
             })
             dca_count += 1
             avg_entry = position_average_entry(fills)
+            profit_protection_peak_roi = 0.0
+            profit_protection_floor_roi = 0.0
 
             if getattr(config, "DCA_REPRICE_TP_AFTER_FILL", True):
                 trend_slice = closed_slice(
@@ -988,12 +1110,20 @@ def simulate_trade(
                         confirmation_type=confirmation_type,
                         dca_context=True,
                     )
+                    tp1_price = float(tp_price)
+                    tp1_mode = tp_mode
                     sl_price, sl_mode = compute_stop_loss(
                         side,
                         avg_entry,
                         confirm_slice,
                         confirmation_type,
                     )
+
+            if (
+                getattr(config, "DCA_TRIGGER_MODE", "static_roi") ==
+                "adaptive_hybrid"
+            ):
+                break
 
         adverse_price = float(candle["low"]) if side == "BUY" else float(candle["high"])
         adverse_roi = abs(
@@ -1007,35 +1137,57 @@ def simulate_trade(
             if side == "BUY"
             else float(candle["low"])
         )
-        profit_info = evaluate_reversal_profit_protection(
-            side,
-            avg_entry,
-            favorable_price,
-            peak_roi=max_seen_favorable_roi,
-            leverage=config.LEVERAGE,
+        favorable_roi = (
+            ((favorable_price - avg_entry) / avg_entry) *
+            float(config.LEVERAGE) *
+            100
+            if side == "BUY"
+            else ((avg_entry - favorable_price) / avg_entry) *
+            float(config.LEVERAGE) *
+            100
         )
         max_seen_favorable_roi = max(
             max_seen_favorable_roi,
+            favorable_roi,
+            0,
+        )
+        profit_protection_peak_roi = max(
+            profit_protection_peak_roi,
+            favorable_roi,
+            0,
+        )
+        route = (
+            "REVERSAL"
+            if str(confirmation_type or "").upper() == "REVERSAL"
+            else "TREND"
+        )
+        profit_info = evaluate_route_profit_protection(
+            side,
+            avg_entry,
+            favorable_price,
+            peak_roi=profit_protection_peak_roi,
+            leverage=config.LEVERAGE,
+            confirmation_type=route,
+        )
+        profit_protection_peak_roi = max(
+            profit_protection_peak_roi,
             float(profit_info.get("peak_roi", 0) or 0),
         )
-        reversal_profit_floor_roi = float(
+        profit_protection_floor_roi = float(
             profit_info.get("floor_roi", 0) or 0
         )
 
         if candle_hits_sl(side, candle, sl_price):
             exit_price = apply_exit_slippage(side, sl_price)
             exit_candle = candle
-            exit_reason = "SL"
+            exit_reason = "RUNNER_SL" if tp1_hit else "SL"
             break
 
-        if (
-            str(confirmation_type or "").upper() == "REVERSAL" and
-            profit_info.get("armed")
-        ):
+        if profit_info.get("armed"):
             profit_floor_price = roi_to_price(
                 side,
                 avg_entry,
-                reversal_profit_floor_roi,
+                profit_protection_floor_roi,
             )
             profit_floor_hit = (
                 float(candle["low"]) <= profit_floor_price
@@ -1046,13 +1198,60 @@ def simulate_trade(
             if profit_floor_hit:
                 exit_price = apply_exit_slippage(side, profit_floor_price)
                 exit_candle = candle
-                exit_reason = "REVERSAL_PROFIT_PROTECTION"
+                exit_reason = f"{route}_PROFIT_PROTECTION"
                 break
 
         if candle_hits_tp(side, candle, tp_price):
+            if multi_tp_enabled and not tp1_hit:
+                tp1_exit_price = apply_exit_slippage(side, tp_price)
+                partial_exits.extend(
+                    realize_partial_exit(
+                        fills,
+                        tp1_close_pct,
+                        tp1_exit_price,
+                    )
+                )
+                tp1_hit = True
+                tp1_time = int(candle["close_time"])
+                trend_slice = closed_slice(
+                    frames["trend"].indicators,
+                    candle_time,
+                    trend_interval,
+                )
+                confirm_slice = closed_slice(
+                    frames["confirm"].indicators,
+                    candle_time,
+                    confirm_interval,
+                )
+                tp2_price, tp2_mode = compute_runner_take_profit(
+                    side,
+                    float(tp_price),
+                    trend_slice,
+                    confirm_slice,
+                    confirmation_type=confirmation_type,
+                )
+                runner_sl, runner_sl_info = calculate_runner_stop(
+                    side,
+                    avg_entry,
+                    float(tp_price),
+                    confirm_slice,
+                    leverage=config.LEVERAGE,
+                )
+
+                if (
+                    getattr(config, "TP1_RUNNER_STOP_ENABLED", True) and
+                    runner_sl is not None
+                ):
+                    sl_price = runner_sl
+                    sl_mode = f"RUNNER_{runner_sl_info.get('source', 'PROFIT_LOCK')}"
+
+                tp_price = float(tp2_price)
+                tp_mode = tp2_mode
+                continue
+
             exit_price = apply_exit_slippage(side, tp_price)
             exit_candle = candle
-            exit_reason = "TP"
+            exit_reason = "TP2" if tp1_hit else "TP"
             break
 
     if exit_price is None:
@@ -1063,9 +1262,22 @@ def simulate_trade(
                 exit_candle = exit_df.iloc[min(start_index, len(exit_df) - 1)]
 
         exit_price = apply_exit_slippage(side, float(exit_candle["close"]))
-        exit_reason = "TIMEOUT" if end_index < len(exit_df) else "DATA_END"
+        exit_reason = (
+            "RUNNER_TIMEOUT"
+            if tp1_hit and end_index < len(exit_df)
+            else "RUNNER_DATA_END"
+            if tp1_hit
+            else "TIMEOUT"
+            if end_index < len(exit_df)
+            else "DATA_END"
+        )
 
-    gross, fees, net, roi = calculate_trade_pnl(side, fills, exit_price)
+    gross, fees, net, roi = calculate_trade_pnl(
+        side,
+        fills,
+        exit_price,
+        partial_exits=partial_exits,
+    )
     exit_time = int(
         exit_time_override
         if exit_time_override is not None
@@ -1087,6 +1299,23 @@ def simulate_trade(
         "exit_price": round(float(exit_price), 8),
         "tp_price": round(float(tp_price), 8),
         "tp_mode": tp_mode,
+        "tp1_hit": tp1_hit,
+        "tp1_price": round(float(tp1_price), 8),
+        "tp1_mode": tp1_mode,
+        "tp1_exit_price": (
+            round(float(tp1_exit_price), 8)
+            if tp1_exit_price is not None
+            else ""
+        ),
+        "tp1_time": ms_to_iso(tp1_time) if tp1_time is not None else "",
+        "tp1_ms": int(tp1_time) if tp1_time is not None else None,
+        "tp1_close_pct": (
+            tp1_close_pct
+            if tp1_hit
+            else 0
+        ),
+        "tp2_price": round(float(tp2_price), 8) if tp2_price is not None else "",
+        "tp2_mode": tp2_mode,
         "sl_price": round(float(sl_price), 8) if sl_price is not None else "",
         "sl_mode": sl_mode,
         "exit_reason": exit_reason,
@@ -1101,7 +1330,22 @@ def simulate_trade(
         "duration_hours": round(duration_hours, 2),
         "max_adverse_roi": round(max_seen_adverse_roi, 2),
         "max_favorable_roi": round(max_seen_favorable_roi, 2),
-        "reversal_profit_floor_roi": round(reversal_profit_floor_roi, 2),
+        "profit_protection_floor_roi": round(
+            profit_protection_floor_roi,
+            2,
+        ),
+        "reversal_profit_floor_roi": round(
+            profit_protection_floor_roi
+            if str(confirmation_type or "").upper() == "REVERSAL"
+            else 0,
+            2,
+        ),
+        "trend_profit_floor_roi": round(
+            profit_protection_floor_roi
+            if str(confirmation_type or "").upper() != "REVERSAL"
+            else 0,
+            2,
+        ),
         "dca_blocked_count": dca_blocked_count,
         "last_dca_block_reason": last_dca_block_reason,
         "early_invalidation_reason": early_invalidation_reason,
@@ -1292,6 +1536,17 @@ def backtest_position_limits(pool):
     )
 
 
+def _backtest_limit_with_tp1_capacity(base_limit, runner_count, extra_cap):
+    if base_limit is None:
+        return None
+
+    earned = min(
+        max(int(runner_count or 0), 0),
+        max(int(extra_cap or 0), 0),
+    )
+    return base_limit + earned
+
+
 def apply_position_limits(trades):
     if not getattr(config, "BACKTEST_APPLY_POSITION_LIMITS", True):
         return trades, 0
@@ -1313,6 +1568,37 @@ def apply_position_limits(trades):
         total_count = len(open_trades)
         buy_count = sum(1 for item in open_trades if item["side"] == "BUY")
         sell_count = sum(1 for item in open_trades if item["side"] == "SELL")
+
+        if getattr(config, "TP1_EXTRA_SLOTS_ENABLED", False):
+            runners = [
+                item for item in open_trades
+                if (
+                    item.get("tp1_hit") and
+                    item.get("tp1_ms") is not None and
+                    int(item["tp1_ms"]) <= int(trade["entry_ms"])
+                )
+            ]
+            runner_buy_count = sum(
+                1 for item in runners if item["side"] == "BUY"
+            )
+            runner_sell_count = sum(
+                1 for item in runners if item["side"] == "SELL"
+            )
+            max_total = _backtest_limit_with_tp1_capacity(
+                max_total,
+                len(runners),
+                getattr(config, "TP1_EXTRA_TOTAL_POSITIONS", 0),
+            )
+            max_buy = _backtest_limit_with_tp1_capacity(
+                max_buy,
+                runner_buy_count,
+                getattr(config, "TP1_EXTRA_BUY_POSITIONS", 0),
+            )
+            max_sell = _backtest_limit_with_tp1_capacity(
+                max_sell,
+                runner_sell_count,
+                getattr(config, "TP1_EXTRA_SELL_POSITIONS", 0),
+            )
 
         if max_total is not None and total_count >= max_total:
             skipped += 1
@@ -1371,6 +1657,17 @@ def summarise_trades(trades, skipped_by_limits):
     total = len(trades)
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
     net_pnl = equity - balance
+    notes = [
+        "Backtest uses historical OHLCV candles and simulated fills.",
+        "News, LLM, realtime websocket confirmation, order-book flow, and private account state are not replayed.",
+        "Intracandle order is conservative: DCA, SL, then TP are evaluated inside the same candle.",
+    ]
+
+    if getattr(config, "BACKTEST_MULTI_TP_ENABLED", False):
+        notes.append(
+            "Multi-stage TP realizes TP1 pro rata, disables later DCA, then "
+            "models TP2 and the runner profit-lock stop from the next candle."
+        )
 
     return {
         "initial_balance": round(balance, 4),
@@ -1392,11 +1689,7 @@ def summarise_trades(trades, skipped_by_limits):
         "avg_duration_hours": round(sum(durations) / len(durations), 2) if durations else 0,
         "dca_trades": dca_trades,
         "skipped_by_position_limits": skipped_by_limits,
-        "notes": [
-            "Backtest uses historical OHLCV candles and simulated fills.",
-            "News, LLM, realtime websocket confirmation, order-book flow, and private account state are not replayed.",
-            "Intracandle order is conservative: DCA, SL, then TP are evaluated inside the same candle.",
-        ],
+        "notes": notes,
         "equity_curve": equity_curve,
     }
 
@@ -1586,6 +1879,7 @@ def run_backtest(args):
         f"EXIT_TF={getattr(config, 'BACKTEST_EXIT_TIMEFRAME', config.ENTRY_TIMEFRAME)} | "
         f"SLICE_ROWS={getattr(config, 'BACKTEST_SLICE_MAX_ROWS', 0)} | "
         f"BTC_CONTEXT={getattr(config, 'BACKTEST_USE_BTC_CONTEXT', True)} | "
+        f"MULTI_TP={getattr(config, 'BACKTEST_MULTI_TP_ENABLED', False)} | "
         f"CONFIRMATION_TYPES={','.join(allowed_confirmation_types) if allowed_confirmation_types else 'ALL'}",
         flush=True,
     )
@@ -1658,6 +1952,52 @@ def run_backtest(args):
             "slice_max_rows": int(getattr(config, "BACKTEST_SLICE_MAX_ROWS", 0) or 0),
             "use_btc_context": bool(getattr(config, "BACKTEST_USE_BTC_CONTEXT", True)),
             "use_dca": bool(getattr(config, "BACKTEST_USE_DCA", False)),
+            "dca_trigger_mode": getattr(
+                config,
+                "DCA_TRIGGER_MODE",
+                "static_roi",
+            ),
+            "dca_trigger_rois": list(getattr(config, "DCA_TRIGGER_ROIS", [])),
+            "dca_max_adverse_roi": float(
+                getattr(config, "DCA_MAX_ADVERSE_ROI", 0)
+            ),
+            "dca_min_seconds_between_orders": int(
+                getattr(config, "DCA_MIN_SECONDS_BETWEEN_ORDERS", 0)
+            ),
+            "dca_adaptive_atr_multipliers": list(
+                getattr(config, "DCA_ADAPTIVE_ATR_MULTIPLIERS", [])
+            ),
+            "dca_adaptive_require_structure": bool(
+                getattr(config, "DCA_ADAPTIVE_REQUIRE_STRUCTURE", True)
+            ),
+            "dca_adaptive_require_recovery": bool(
+                getattr(config, "DCA_ADAPTIVE_REQUIRE_RECOVERY", True)
+            ),
+            "multi_tp_enabled": bool(
+                getattr(config, "BACKTEST_MULTI_TP_ENABLED", False) and
+                getattr(config, "MULTI_TP_ENABLED", False)
+            ),
+            "tp1_extra_slots_enabled": bool(
+                getattr(config, "TP1_EXTRA_SLOTS_ENABLED", False)
+            ),
+            "tp1_extra_total_positions": int(
+                getattr(config, "TP1_EXTRA_TOTAL_POSITIONS", 0)
+            ),
+            "tp1_extra_buy_positions": int(
+                getattr(config, "TP1_EXTRA_BUY_POSITIONS", 0)
+            ),
+            "tp1_extra_sell_positions": int(
+                getattr(config, "TP1_EXTRA_SELL_POSITIONS", 0)
+            ),
+            "tp1_close_position_pct": float(
+                getattr(config, "TP1_CLOSE_POSITION_PCT", 50)
+            ),
+            "tp2_fallback_roi": float(
+                getattr(config, "TP2_FALLBACK_ROI", 35)
+            ),
+            "runner_min_lock_roi": float(
+                getattr(config, "TP1_RUNNER_MIN_LOCK_ROI", 5)
+            ),
             "trend_sl_enabled": bool(
                 getattr(config, "TREND_SL_ENABLED", getattr(config, "SL_ENABLED", False))
             ),
@@ -1684,6 +2024,18 @@ def run_backtest(args):
             ),
             "reversal_profit_retrace_pct": float(
                 getattr(config, "REVERSAL_PROFIT_PROTECTION_RETRACE_PCT", 50)
+            ),
+            "trend_profit_protection_enabled": bool(
+                getattr(config, "TREND_PROFIT_PROTECTION_ENABLED", False)
+            ),
+            "trend_profit_trigger_roi": float(
+                getattr(config, "TREND_PROFIT_PROTECTION_TRIGGER_ROI", 15)
+            ),
+            "trend_profit_lock_roi": float(
+                getattr(config, "TREND_PROFIT_PROTECTION_LOCK_ROI", 5)
+            ),
+            "trend_profit_retrace_pct": float(
+                getattr(config, "TREND_PROFIT_PROTECTION_RETRACE_PCT", 45)
             ),
             "reversal_entry_enabled": bool(
                 getattr(config, "REVERSAL_ENTRY_ENABLED", True)

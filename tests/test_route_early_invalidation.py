@@ -286,6 +286,10 @@ class RouteEarlyInvalidationBacktestTests(unittest.TestCase):
             config,
             "BACKTEST_MAX_HOLD_CANDLES",
             5,
+        ), patch.object(
+            config,
+            "LEVERAGE",
+            10,
         ):
             result = simulate_trade(
                 "BTCUSDT",

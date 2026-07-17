@@ -9,12 +9,20 @@ from backtest import (
 )
 
 
-def trade(side, confirmation_type, entry_ms, exit_ms):
+def trade(
+    side,
+    confirmation_type,
+    entry_ms,
+    exit_ms,
+    tp1_ms=None,
+):
     return {
         "side": side,
         "confirmation_type": confirmation_type,
         "entry_ms": entry_ms,
         "exit_ms": exit_ms,
+        "tp1_hit": tp1_ms is not None,
+        "tp1_ms": tp1_ms,
     }
 
 
@@ -57,6 +65,56 @@ class BacktestPositionLimitTests(unittest.TestCase):
             accepted, skipped = apply_position_limits(trades)
 
         self.assertEqual(accepted, [])
+        self.assertEqual(skipped, 1)
+
+    def test_confirmed_tp1_runner_unlocks_one_replacement_slot(self):
+        trades = [
+            trade("BUY", "TREND", 0, 100, tp1_ms=50),
+            trade("BUY", "TREND", 40, 90),
+            trade("BUY", "TREND", 60, 90),
+        ]
+
+        with (
+            patch.object(config, "BACKTEST_APPLY_POSITION_LIMITS", True),
+            patch.object(config, "MAX_TOTAL_POSITIONS", 1),
+            patch.object(config, "MAX_BUY_POSITIONS", 1),
+            patch.object(config, "MAX_SELL_POSITIONS", 1),
+            patch.object(config, "TP1_EXTRA_SLOTS_ENABLED", True),
+            patch.object(config, "TP1_EXTRA_TOTAL_POSITIONS", 1),
+            patch.object(config, "TP1_EXTRA_BUY_POSITIONS", 1),
+            patch.object(config, "TP1_EXTRA_SELL_POSITIONS", 1),
+        ):
+            accepted, skipped = apply_position_limits(trades)
+
+        self.assertEqual(
+            [item["entry_ms"] for item in accepted],
+            [0, 60],
+        )
+        self.assertEqual(skipped, 1)
+
+    def test_tp1_extra_slot_disappears_after_runner_closes(self):
+        trades = [
+            trade("BUY", "TREND", 0, 70, tp1_ms=50),
+            trade("BUY", "TREND", 60, 100),
+            trade("BUY", "TREND", 80, 100),
+        ]
+
+        with (
+            patch.object(config, "BACKTEST_APPLY_POSITION_LIMITS", True),
+            patch.object(config, "MAX_TOTAL_POSITIONS", 1),
+            patch.object(config, "MAX_BUY_POSITIONS", 1),
+            patch.object(config, "MAX_SELL_POSITIONS", 1),
+            patch.object(config, "TP1_EXTRA_SLOTS_ENABLED", True),
+            patch.object(config, "TP1_EXTRA_TOTAL_POSITIONS", 1),
+            patch.object(config, "TP1_EXTRA_BUY_POSITIONS", 1),
+            patch.object(config, "TP1_EXTRA_SELL_POSITIONS", 1),
+        ):
+            accepted, skipped = apply_position_limits(trades)
+
+        self.assertEqual(
+            [item["entry_ms"] for item in accepted],
+            [0, 60],
+        )
         self.assertEqual(skipped, 1)
 
     def test_reversal_diagnostics_count_unique_rejection_reasons(self):
