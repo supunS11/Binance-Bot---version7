@@ -22,6 +22,16 @@ def score_to_confidence(score, max_score=None):
     return round(min((score / max(max_score, 1)) * 100, 100), 2)
 
 
+def score_to_uncapped_index(score, max_score=None):
+    if score <= 0:
+        return 0
+
+    if max_score is None:
+        max_score = get_config_float("LONG_TERM_CONFIDENCE_MAX_SCORE", 42)
+
+    return round((score / max(max_score, 1)) * 100, 2)
+
+
 def get_config_float(name, default):
     try:
         return float(getattr(config, name, default))
@@ -2345,7 +2355,48 @@ def _btc_context_score(side, btc_trend, btc_corr, rs):
     return score
 
 
-def _futures_participation_score(side, participation):
+def _closed_frame_return_pct(df, periods):
+    try:
+        closes = df["close"].iloc[:-1]
+        periods = max(int(periods), 1)
+
+        if len(closes) < periods + 1:
+            return None
+
+        start = float(closes.iloc[-(periods + 1)])
+        end = float(closes.iloc[-1])
+
+        if start <= 0:
+            return None
+
+        return round(((end - start) / start) * 100, 3)
+
+    except Exception:
+        return None
+
+
+def _oi_price_state(oi_change, price_change, oi_min, price_min):
+    if oi_change is None or price_change is None:
+        return "UNAVAILABLE"
+
+    if oi_change >= oi_min:
+        if price_change >= price_min:
+            return "LONG_BUILD"
+        if price_change <= -price_min:
+            return "SHORT_BUILD"
+        return "OI_BUILD_FLAT_PRICE"
+
+    if oi_change <= -oi_min:
+        if price_change >= price_min:
+            return "SHORT_COVERING"
+        if price_change <= -price_min:
+            return "LONG_LIQUIDATION"
+        return "OI_UNWIND_FLAT_PRICE"
+
+    return "OI_NEUTRAL"
+
+
+def _futures_participation_score(side, participation, price_change_pct=None):
     if not participation or not participation.get("available"):
         return 0
 
@@ -2356,15 +2407,30 @@ def _futures_participation_score(side, participation):
     top_ratio = participation.get("top_long_short_ratio")
     funding_rate = participation.get("funding_rate")
     oi_min = get_config_float("FUTURES_CONTEXT_OI_MIN_CHANGE_PCT", 1.0)
+    price_min = get_config_float("FUTURES_CONTEXT_PRICE_MIN_CHANGE_PCT", 0.5)
     taker_buy_min = get_config_float("FUTURES_CONTEXT_TAKER_BUY_MIN", 1.05)
     taker_sell_max = get_config_float("FUTURES_CONTEXT_TAKER_SELL_MAX", 0.95)
     crowd_long_max = get_config_float("FUTURES_CONTEXT_CROWD_LONG_MAX", 2.2)
     crowd_short_min = get_config_float("FUTURES_CONTEXT_CROWD_SHORT_MIN", 0.45)
     funding_abs_max = get_config_float("FUTURES_CONTEXT_FUNDING_ABS_MAX", 0.001)
 
-    if oi_change is not None:
-        score = add_score(score, oi_change >= oi_min, 1.5)
-        score -= 1 if oi_change <= -oi_min else 0
+    oi_state = _oi_price_state(
+        _safe_float(oi_change, None),
+        _safe_float(price_change_pct, None),
+        oi_min,
+        price_min,
+    )
+    participation["price_change_pct"] = price_change_pct
+    participation["oi_price_state"] = oi_state
+
+    if oi_state == "LONG_BUILD":
+        score += 1.5 if side == "BUY" else -1
+    elif oi_state == "SHORT_BUILD":
+        score += 1.5 if side == "SELL" else -1
+    elif oi_state == "SHORT_COVERING":
+        score += 0.5 if side == "BUY" else -0.25
+    elif oi_state == "LONG_LIQUIDATION":
+        score += 0.5 if side == "SELL" else -0.25
 
     if taker_ratio is not None:
         if side == "BUY":
@@ -4052,12 +4118,24 @@ def _refresh_side_decision(side_data):
     if trend_ok:
         side_data["confirmation_type"] = "TREND"
         side_data["confidence"] = side_data.get("trend_confidence", 0)
+        side_data["uncapped_score_index"] = side_data.get(
+            "trend_uncapped_score_index",
+            side_data.get("confidence", 0),
+        )
     elif reversal_ok:
         side_data["confirmation_type"] = "REVERSAL"
         side_data["confidence"] = side_data.get("reversal_confidence", 0)
+        side_data["uncapped_score_index"] = side_data.get(
+            "reversal_uncapped_score_index",
+            side_data.get("confidence", 0),
+        )
     else:
         side_data["confirmation_type"] = "NONE"
         side_data["confidence"] = side_data.get("trend_confidence", 0)
+        side_data["uncapped_score_index"] = side_data.get(
+            "trend_uncapped_score_index",
+            side_data.get("confidence", 0),
+        )
 
     return side_data
 
@@ -4268,7 +4346,15 @@ def _side_signal_score(
     confirm_score, confirm_ok, confirm_quality = _confirmation_score(side, confirm_df)
     entry_score, entry_ok, ema_distance, entry_quality = _entry_score(side, entry_df)
     btc_score = _btc_context_score(side, btc_trend, btc_corr, rs)
-    participation_score = _futures_participation_score(side, participation)
+    futures_price_change = _closed_frame_return_pct(
+        confirm_df,
+        get_config_float("FUTURES_CONTEXT_LIMIT", 8),
+    )
+    participation_score = _futures_participation_score(
+        side,
+        participation,
+        futures_price_change,
+    )
     futures_ok, futures_gate_reasons = _futures_context_gate(
         participation_score,
         participation
@@ -4315,7 +4401,12 @@ def _side_signal_score(
     )
     score = max(0, total)
     trend_confidence = score_to_confidence(score)
+    trend_uncapped_score_index = score_to_uncapped_index(score)
     reversal_confidence = score_to_confidence(
+        score,
+        get_config_float("REVERSAL_CONFIDENCE_MAX_SCORE", 34)
+    )
+    reversal_uncapped_score_index = score_to_uncapped_index(
         score,
         get_config_float("REVERSAL_CONFIDENCE_MAX_SCORE", 34)
     )
@@ -4423,7 +4514,9 @@ def _side_signal_score(
         "side": side,
         "score": score,
         "trend_confidence": trend_confidence,
+        "trend_uncapped_score_index": trend_uncapped_score_index,
         "reversal_confidence": reversal_confidence,
+        "reversal_uncapped_score_index": reversal_uncapped_score_index,
         "base_score": trend_score + confirm_score + entry_score + btc_score + level_score,
         "trend_score": trend_score,
         "confirm_score": confirm_score,

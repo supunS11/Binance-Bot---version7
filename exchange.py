@@ -14,7 +14,7 @@ from indicators import apply_indicators
 from logger import log_info, log_warning, log_error
 
 
-client = Client(config.API_KEY, config.SECRET_KEY)
+client = Client(config.API_KEY, config.SECRET_KEY, ping=False)
 _exchange_info_cache = None
 _last_kline_request_at = 0.0
 _public_rest_backoff_until = 0.0
@@ -41,8 +41,15 @@ _RATE_LIMIT_RE = re.compile(r"(code=-1003|too many requests)", re.IGNORECASE)
 # =========================
 # SYNC TIME
 # =========================
-server_time = client.get_server_time()
-client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
+try:
+    server_time = client.get_server_time()
+    client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
+except Exception as exc:
+    client.timestamp_offset = 0
+    log_warning(
+        "Binance startup time sync unavailable; using zero timestamp offset | "
+        f"ERROR={exc}"
+    )
 
 
 def _throttle_kline_request():
@@ -706,6 +713,25 @@ def _change_pct(items, field):
     return round(((last - first) / first) * 100, 2)
 
 
+def _ema_value(items, field, alpha=0.35):
+    values = [
+        _to_float(item.get(field))
+        for item in (items or [])
+        if _to_float(item.get(field)) is not None
+    ]
+
+    if not values:
+        return None
+
+    alpha = min(max(float(alpha), 0.01), 1.0)
+    result = values[0]
+
+    for value in values[1:]:
+        result = (alpha * value) + ((1 - alpha) * result)
+
+    return round(result, 6)
+
+
 def _get_taker_longshort_ratio(params):
     method = getattr(client, "futures_taker_longshort_ratio", None)
 
@@ -743,6 +769,8 @@ def get_futures_participation(symbol):
         "limit": limit,
         "oi_change_pct": None,
         "taker_buy_sell_ratio": None,
+        "taker_buy_sell_ratio_latest": None,
+        "taker_ratio_samples": 0,
         "global_long_short_ratio": None,
         "top_long_short_ratio": None,
         "funding_rate": None,
@@ -759,10 +787,17 @@ def get_futures_participation(symbol):
 
     try:
         _futures_context_throttle()
-        taker = _latest_item(_get_taker_longshort_ratio(params))
-        data["taker_buy_sell_ratio"] = _to_float(
+        taker_history = _get_taker_longshort_ratio(params) or []
+        taker = _latest_item(taker_history)
+        data["taker_buy_sell_ratio_latest"] = _to_float(
             taker.get("buySellRatio") if taker else None
         )
+        data["taker_buy_sell_ratio"] = _ema_value(
+            taker_history,
+            "buySellRatio",
+            getattr(config, "FUTURES_CONTEXT_TAKER_EMA_ALPHA", 0.35),
+        )
+        data["taker_ratio_samples"] = len(taker_history)
     except Exception as e:
         _set_public_rest_backoff(e, f"taker_longshort_ratio:{symbol}")
         data["errors"].append(f"TAKER:{e}")

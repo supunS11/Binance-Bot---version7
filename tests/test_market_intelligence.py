@@ -1,0 +1,85 @@
+import time
+import unittest
+from unittest.mock import patch
+
+import pandas as pd
+
+from market_intelligence import (
+    MarketFlowMonitor,
+    build_breadth_sample,
+    calculate_market_breadth,
+    calculate_regime_transition,
+)
+
+
+class MarketFlowTests(unittest.TestCase):
+    def test_aggressive_buy_flow_and_bid_depth_produce_buy_score(self):
+        monitor = MarketFlowMonitor(["BTCUSDT"])
+        now_ms = int(time.time() * 1000)
+
+        with patch("config.MARKET_FLOW_MIN_NOTIONAL_USDT", 0):
+            for offset in range(3):
+                monitor.handle_message({
+                    "e": "aggTrade",
+                    "s": "BTCUSDT",
+                    "p": "100",
+                    "q": "10",
+                    "m": False,
+                    "T": now_ms + offset,
+                })
+
+            monitor.handle_message({
+                "s": "BTCUSDT",
+                "b": "99.9",
+                "B": "30",
+                "a": "100.1",
+                "A": "10",
+            })
+            snapshot = monitor.snapshot("BTCUSDT")
+
+        self.assertTrue(snapshot["available"])
+        self.assertGreater(snapshot["buy_score"], 0)
+        self.assertLess(snapshot["sell_score"], 0)
+
+
+class BreadthAndTransitionTests(unittest.TestCase):
+    @staticmethod
+    def frame(prices):
+        rows = []
+
+        for index, close in enumerate(prices):
+            rows.append({
+                "close": close,
+                "ema20": close - 1,
+                "ema50": close - 2,
+                "volume": 120,
+                "volume_sma": 100,
+            })
+
+        return pd.DataFrame(rows)
+
+    def test_broad_participation_supports_buy_ranking(self):
+        samples = [
+            build_breadth_sample(f"S{index}", self.frame(range(90, 101)))
+            for index in range(25)
+        ]
+        breadth = calculate_market_breadth(samples)
+
+        self.assertTrue(breadth["available"])
+        self.assertGreater(breadth["buy_score"], 0)
+        self.assertLess(breadth["sell_score"], 0)
+
+    def test_change_point_detects_recent_upward_shift(self):
+        prices = [100 + (index * 0.01) for index in range(40)]
+        prices.extend(prices[-1] + (index * 1.5) for index in range(1, 9))
+        prices.append(prices[-1])
+        result = calculate_regime_transition(self.frame(prices))
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["transition"])
+        self.assertEqual(result["direction"], "UP")
+        self.assertGreater(result["buy_score"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

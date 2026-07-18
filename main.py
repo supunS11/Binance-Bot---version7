@@ -53,6 +53,14 @@ from strategy import (
 )
 from risk_management import calculate_position_size
 from signal_journal import append_signal_journal
+from signal_calibration import calibration_probability
+from signal_outcomes import register_signal_outcome, observe_signal_outcomes
+from market_intelligence import (
+    MarketFlowMonitor,
+    build_breadth_sample,
+    calculate_market_breadth,
+    calculate_regime_transition,
+)
 from llm_service import (
     apply_llm_filter,
     begin_llm_scan_budget,
@@ -3507,7 +3515,18 @@ def calculate_signal_rank(candidate):
     side_data = analysis.get((signal or "").lower(), {}) or {}
     news_context = candidate.get("news_context") or {}
     llm_context = candidate.get("llm_context") or {}
-    rank = _safe_float(side_data.get("confidence"), analysis.get("best_confidence", 0))
+    uncapped_limit = max(
+        _safe_float(
+            getattr(config, "SIGNAL_RANKING_UNCAPPED_INDEX_MAX", 140),
+            140,
+        ),
+        100,
+    )
+    score_index = _safe_float(
+        side_data.get("uncapped_score_index"),
+        side_data.get("confidence", analysis.get("best_confidence", 0)),
+    )
+    rank = min(score_index, uncapped_limit)
 
     rank += _safe_float(side_data.get("quality_score")) * config.SIGNAL_RANKING_QUALITY_WEIGHT
     rank += _safe_float(side_data.get("participation_score")) * config.SIGNAL_RANKING_FLOW_WEIGHT
@@ -3549,7 +3568,102 @@ def calculate_signal_rank(candidate):
     elif risk_label == "medium":
         rank -= 1.5
 
+    market_context = candidate.get("market_context") or {}
+    flow = market_context.get("flow") or {}
+    breadth = market_context.get("breadth") or {}
+    transition = market_context.get("transition") or {}
+    calibration = market_context.get("calibration") or {}
+    side_key = (signal or "").lower()
+    rank += _safe_float(flow.get(f"{side_key}_score")) * _safe_float(
+        getattr(config, "MARKET_FLOW_RANK_WEIGHT", 1),
+        1,
+    )
+    rank += _safe_float(breadth.get(f"{side_key}_score")) * _safe_float(
+        getattr(config, "MARKET_BREADTH_RANK_WEIGHT", 1),
+        1,
+    )
+    rank += _safe_float(transition.get(f"{side_key}_score")) * _safe_float(
+        getattr(config, "REGIME_TRANSITION_RANK_WEIGHT", 1),
+        1,
+    )
+
+    if calibration.get("available"):
+        probability = _safe_float(calibration.get("probability"), 0.5)
+        rank += (probability - 0.5) * _safe_float(
+            getattr(config, "SIGNAL_CALIBRATION_RANK_WEIGHT", 8),
+            8,
+        )
+
     return round(rank, 2)
+
+
+def enrich_candidate_market_context(candidate, flow_monitor, breadth_context):
+    signal = str(candidate.get("signal") or "").upper()
+    analysis = candidate.get("analysis") or {}
+    side_data = analysis.get(signal.lower(), {}) or {}
+    flow = (
+        flow_monitor.snapshot(candidate.get("symbol"))
+        if flow_monitor and getattr(config, "MARKET_FLOW_ENABLED", True)
+        else {"available": False, "buy_score": 0, "sell_score": 0}
+    )
+    breadth = (
+        breadth_context
+        if getattr(config, "MARKET_BREADTH_ENABLED", True)
+        else {"available": False, "buy_score": 0, "sell_score": 0}
+    )
+    transition = (
+        calculate_regime_transition(candidate.get("entry_df"))
+        if getattr(config, "REGIME_TRANSITION_ENABLED", True)
+        else {"available": False, "buy_score": 0, "sell_score": 0}
+    )
+    route = get_candidate_signal_type(candidate)
+
+    if (side_data.get("continuation_pullback") or {}).get("active"):
+        route = "CONTINUATION_PULLBACK"
+    elif (side_data.get("trend_timing_rescue") or {}).get("active"):
+        route = "TREND_TIMING_RESCUE"
+
+    calibration = calibration_probability(route, side_data.get("score", 0))
+    candidate["market_context"] = {
+        "flow": flow,
+        "breadth": breadth,
+        "transition": transition,
+        "calibration": calibration,
+        "route": route,
+    }
+    candidate["rank_score"] = calculate_signal_rank(candidate)
+    return candidate
+
+
+def market_flow_hard_veto(candidate):
+    if not getattr(config, "MARKET_FLOW_HARD_VETO_ENABLED", False):
+        return False, ""
+
+    signal = str(candidate.get("signal") or "").upper()
+    flow = (candidate.get("market_context") or {}).get("flow") or {}
+
+    if not flow.get("available"):
+        return False, ""
+
+    side_key = signal.lower()
+    score = _safe_float(flow.get(f"{side_key}_score"))
+    conflicts = int(flow.get(f"{side_key}_conflicts", 0) or 0)
+    score_limit = _safe_float(
+        getattr(config, "MARKET_FLOW_HARD_VETO_SCORE", -4),
+        -4,
+    )
+    conflict_limit = max(
+        int(getattr(config, "MARKET_FLOW_HARD_VETO_MIN_CONFLICTS", 3)),
+        1,
+    )
+    blocked = score <= score_limit and conflicts >= conflict_limit
+    reason = (
+        f"PERSISTENT_MARKET_FLOW_CONFLICT SCORE={score} "
+        f"CONFLICTS={conflicts}/{conflict_limit}"
+        if blocked
+        else ""
+    )
+    return blocked, reason
 
 
 def get_candidate_signal_type(candidate):
@@ -3777,6 +3891,28 @@ def execute_entry_candidate(
             log_warning(f"{symbol} entry skipped | bot shutdown requested")
             return position_details, open_positions, False
 
+        flow_blocked, flow_reason = market_flow_hard_veto(candidate)
+
+        if flow_blocked:
+            log_warning(f"{symbol} ENTRY BLOCKED | {flow_reason}")
+            append_signal_journal(
+                symbol,
+                final_analysis,
+                participation,
+                trend_df,
+                confirm_df,
+                entry_df,
+                btc_trend,
+                btc_corr,
+                rs,
+                action="SKIPPED_MARKET_FLOW",
+                skip_reason=flow_reason,
+                news_context=news_context,
+                llm_context=llm_context,
+                market_context=candidate.get("market_context"),
+            )
+            return position_details, open_positions, False
+
         latest_position_details = get_open_position_details()
 
         if latest_position_details is None:
@@ -3852,7 +3988,9 @@ def execute_entry_candidate(
                 action="SKIPPED_REVERSAL_FUTURES",
                 skip_reason=reason,
                 news_context=news_context,
-                llm_context=llm_context
+                llm_context=llm_context,
+                market_context=candidate.get("market_context"),
+                rank_score=candidate.get("rank_score"),
             )
             return position_details, open_positions, False
 
@@ -3936,7 +4074,9 @@ def execute_entry_candidate(
                     action="SKIPPED_LIVE_GUARD",
                     skip_reason=guard_info.get("reason"),
                     news_context=news_context,
-                    llm_context=llm_context
+                    llm_context=llm_context,
+                    market_context=candidate.get("market_context"),
+                    rank_score=candidate.get("rank_score"),
                 )
                 return position_details, open_positions, False
 
@@ -3974,7 +4114,9 @@ def execute_entry_candidate(
                 action="SKIPPED_PROFIT_ROOM",
                 skip_reason=room_info.get("reason"),
                 news_context=news_context,
-                llm_context=llm_context
+                llm_context=llm_context,
+                market_context=candidate.get("market_context"),
+                rank_score=candidate.get("rank_score"),
             )
             return position_details, open_positions, False
 
@@ -4040,7 +4182,9 @@ def execute_entry_candidate(
                 rs,
                 action="SKIPPED_NEWS_FILTER",
                 skip_reason=news_context.get("reason"),
-                news_context=news_context
+                news_context=news_context,
+                market_context=candidate.get("market_context"),
+                rank_score=candidate.get("rank_score"),
             )
             return position_details, open_positions, False
 
@@ -4077,7 +4221,9 @@ def execute_entry_candidate(
                 action="SKIPPED_LLM_FILTER",
                 skip_reason=llm_context.get("reason"),
                 news_context=news_context,
-                llm_context=llm_context
+                llm_context=llm_context,
+                market_context=candidate.get("market_context"),
+                rank_score=candidate.get("rank_score"),
             )
             return position_details, open_positions, False
 
@@ -4141,6 +4287,8 @@ def execute_entry_candidate(
                 f"{symbol} ENTRY PRICE UNAVAILABLE | USING CURRENT PRICE FOR TP"
             )
 
+        signal_id = register_signal_outcome(candidate, entry_price)
+
         structure_tp = None
 
         if not config.STATIC_TP_ENABLED:
@@ -4200,6 +4348,9 @@ def execute_entry_candidate(
         )
         position_state["signal_type"] = signal_type or "UNKNOWN"
         position_state["confirmation_type"] = signal_type or "UNKNOWN"
+        position_state["signal_id"] = signal_id
+        position_state["signal_rank_score"] = candidate.get("rank_score")
+        position_state["market_context"] = candidate.get("market_context") or {}
         position_state["tp_status"] = "CREATED" if protection_ok else "FAILED"
         position_state["tp_price"] = protection_result.get("tp_price")
         position_state["tp_mode"] = protection_result.get("tp_mode")
@@ -4229,7 +4380,10 @@ def execute_entry_candidate(
             rs,
             action="TRADE_OPENED",
             news_context=news_context,
-            llm_context=llm_context
+            llm_context=llm_context,
+            market_context=candidate.get("market_context"),
+            signal_id=signal_id,
+            rank_score=candidate.get("rank_score"),
         )
 
         log_info(
@@ -4427,6 +4581,8 @@ def run_bot():
     )
     dca_monitor = DcaWebsocketMonitor()
     dca_monitor.start()
+    flow_monitor = MarketFlowMonitor(scan_symbols, shutdown_event=shutdown_event)
+    flow_monitor.start()
     target_margin_monitor = TargetMarginBalanceMonitor()
     target_margin_monitor.start()
 
@@ -4464,6 +4620,7 @@ def run_bot():
 
                 futures_context_queue = []
                 signal_candidates = []
+                breadth_samples = []
                 begin_llm_scan_budget()
 
                 for symbol in scan_symbols:
@@ -4475,6 +4632,15 @@ def run_bot():
                         log_info(f"Checking {symbol}")
 
                         if symbol in open_positions:
+                            open_mark_price = (
+                                position_details.get(symbol, {}).get("mark_price")
+                            )
+                            observe_signal_outcomes(
+                                symbol,
+                                open_mark_price,
+                                open_mark_price,
+                                open_mark_price,
+                            )
                             run_scan_dca_check(
                                 symbol,
                                 position_details[symbol],
@@ -4491,6 +4657,19 @@ def run_bot():
 
                         if trend_df is None or confirm_df is None or entry_df is None:
                             continue
+
+                        breadth_sample = build_breadth_sample(symbol, trend_df)
+
+                        if breadth_sample:
+                            breadth_samples.append(breadth_sample)
+
+                        latest_entry_candle = entry_df.iloc[-2]
+                        observe_signal_outcomes(
+                            symbol,
+                            latest_entry_candle.get("close"),
+                            latest_entry_candle.get("high"),
+                            latest_entry_candle.get("low"),
+                        )
 
                         btc_corr, rs = calculate_btc_context(
                             symbol,
@@ -4631,6 +4810,24 @@ def run_bot():
                                 f"{symbol} FUTURES CONTEXT PROCESSING ERROR: {e}"
                             )
 
+                breadth_context = calculate_market_breadth(breadth_samples)
+                log_info(
+                    "MARKET BREADTH | "
+                    f"AVAILABLE={breadth_context.get('available')} | "
+                    f"SAMPLES={breadth_context.get('sample_count')} | "
+                    f"ABOVE_EMA20={breadth_context.get('above_ema20_pct')}% | "
+                    f"ABOVE_EMA50={breadth_context.get('above_ema50_pct')}% | "
+                    f"ADVANCE={breadth_context.get('advance_pct')}% | "
+                    f"BUY_SCORE={breadth_context.get('buy_score')}"
+                )
+
+                for candidate in signal_candidates:
+                    enrich_candidate_market_context(
+                        candidate,
+                        flow_monitor,
+                        breadth_context,
+                    )
+
                 if config.SIGNAL_RANKING_ENABLED and not shutdown_event.is_set():
                     position_details, open_positions = process_ranked_entry_candidates(
                         signal_candidates,
@@ -4652,6 +4849,7 @@ def run_bot():
 
     finally:
         target_margin_monitor.stop()
+        flow_monitor.stop()
         dca_monitor.stop()
 
     log_warning("BOT STOPPED | manual restart required")
