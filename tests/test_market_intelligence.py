@@ -1,6 +1,6 @@
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -13,6 +13,35 @@ from market_intelligence import (
 
 
 class MarketFlowTests(unittest.TestCase):
+    def test_start_uses_independent_direct_stream_workers(self):
+        monitor = MarketFlowMonitor(["BTCUSDT"])
+
+        with (
+            patch.object(monitor, "_start_watchdog"),
+            patch.object(monitor, "_start_trade_streams") as start_trades,
+            patch.object(monitor, "_start_book_streams") as start_books,
+        ):
+            monitor.start()
+
+        self.assertTrue(monitor.running)
+        self.assertEqual(monitor.trade_generation, 1)
+        start_trades.assert_called_once_with()
+        start_books.assert_called_once_with()
+
+    def test_stop_closes_trade_websockets_and_invalidates_workers(self):
+        monitor = MarketFlowMonitor(["BTCUSDT"])
+        websocket = Mock()
+        monitor.running = True
+        monitor.trade_generation = 3
+        monitor.trade_websockets[1] = websocket
+
+        monitor.stop()
+
+        self.assertFalse(monitor.running)
+        self.assertEqual(monitor.trade_generation, 4)
+        self.assertEqual(monitor.trade_websockets, {})
+        websocket.close.assert_called_once_with()
+
     def test_aggressive_buy_flow_and_bid_depth_produce_buy_score(self):
         monitor = MarketFlowMonitor(["BTCUSDT"])
         now_ms = int(time.time() * 1000)
@@ -40,6 +69,24 @@ class MarketFlowTests(unittest.TestCase):
         self.assertTrue(snapshot["available"])
         self.assertGreater(snapshot["buy_score"], 0)
         self.assertLess(snapshot["sell_score"], 0)
+
+    def test_raw_trade_event_updates_cvd(self):
+        monitor = MarketFlowMonitor(["BTCUSDT"])
+
+        with patch("config.MARKET_FLOW_MIN_NOTIONAL_USDT", 0):
+            monitor.handle_message({
+                "e": "trade",
+                "s": "BTCUSDT",
+                "p": "100",
+                "q": "10",
+                "m": False,
+                "T": int(time.time() * 1000),
+            })
+            snapshot = monitor.snapshot("BTCUSDT")
+
+        self.assertTrue(snapshot["available"])
+        self.assertEqual(snapshot["cvd_1m"], 1.0)
+        self.assertGreater(snapshot["buy_score"], 0)
 
 
 class BreadthAndTransitionTests(unittest.TestCase):

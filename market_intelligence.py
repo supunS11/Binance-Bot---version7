@@ -33,8 +33,6 @@ class MarketFlowMonitor:
         self.enabled = bool(getattr(config, "MARKET_FLOW_ENABLED", True))
         self.symbols = tuple(dict.fromkeys(symbol.upper() for symbol in symbols))
         self.shutdown_event = shutdown_event
-        self.twm = None
-        self.socket_keys = []
         self.running = False
         self.resetting = False
         self.last_message_at = 0.0
@@ -44,6 +42,9 @@ class MarketFlowMonitor:
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.watchdog_thread = None
+        self.trade_threads = []
+        self.trade_websockets = {}
+        self.trade_generation = 0
         self.book_threads = []
         self.data = {
             symbol: {
@@ -65,22 +66,25 @@ class MarketFlowMonitor:
         self._start_watchdog()
 
         try:
-            from binance import ThreadedWebsocketManager
-
-            self.twm = ThreadedWebsocketManager()
-            self.twm.start()
+            # Validate the dependency before worker threads are started.
+            from websockets.sync.client import connect  # noqa: F401
 
             with self.lock:
+                if self.running:
+                    return
+
                 self.running = True
+                self.trade_generation += 1
                 self.last_message_at = time.time()
                 self.last_trade_message_at = self.last_message_at
-                self._subscribe_locked()
 
+            self._start_trade_streams()
             self._start_book_streams()
 
             log_info(
                 f"Market flow websocket started | SYMBOLS={len(self.symbols)} | "
-                f"SOCKETS={len(self.socket_keys)}"
+                f"TRADE_SOCKETS={len(self.trade_threads)} | "
+                f"BOOK_SOCKETS={len(self.book_threads)}"
             )
 
         except Exception as exc:
@@ -92,7 +96,11 @@ class MarketFlowMonitor:
 
         with self.lock:
             self.running = False
-            self._stop_manager_locked()
+            self.trade_generation += 1
+            websockets = list(self.trade_websockets.values())
+            self.trade_websockets = {}
+
+        self._close_websockets(websockets)
 
     def _start_watchdog(self):
         if self.watchdog_thread and self.watchdog_thread.is_alive():
@@ -136,8 +144,88 @@ class MarketFlowMonitor:
             if not resetting and (not running or age >= stale_seconds):
                 self.reset_connection(f"watchdog stale={round(age, 1)}s")
 
-    def _stream_names(self):
-        return [f"{symbol.lower()}@aggTrade" for symbol in self.symbols]
+    def _start_trade_streams(self):
+        chunk_size = max(
+            int(getattr(config, "MARKET_FLOW_STREAMS_PER_SOCKET", 100)),
+            1,
+        )
+
+        with self.lock:
+            generation = self.trade_generation
+
+        threads = []
+
+        for start in range(0, len(self.symbols), chunk_size):
+            symbols = self.symbols[start:start + chunk_size]
+            thread = threading.Thread(
+                target=self._trade_stream_loop,
+                args=(symbols, generation),
+                name=f"market-flow-trade-{(start // chunk_size) + 1}",
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+
+        with self.lock:
+            if generation == self.trade_generation:
+                self.trade_threads = threads
+
+    def _trade_stream_loop(self, symbols, generation):
+        from websockets.sync.client import connect
+
+        streams = "/".join(f"{symbol.lower()}@trade" for symbol in symbols)
+        url = f"wss://fstream.binance.com/stream?streams={streams}"
+        worker_id = threading.get_ident()
+
+        while self._trade_worker_active(generation):
+            try:
+                with connect(
+                    url,
+                    open_timeout=10,
+                    close_timeout=2,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ) as websocket:
+                    with self.lock:
+                        if generation != self.trade_generation:
+                            return
+                        self.trade_websockets[worker_id] = websocket
+
+                    while self._trade_worker_active(generation):
+                        try:
+                            message = websocket.recv(timeout=2)
+                        except TimeoutError:
+                            continue
+
+                        self.handle_message(json.loads(message))
+
+            except Exception as exc:
+                if self._trade_worker_active(generation):
+                    log_warning(f"Market flow trade websocket reconnecting: {exc}")
+                    self.stop_event.wait(3)
+            finally:
+                with self.lock:
+                    current = self.trade_websockets.get(worker_id)
+                    if current is locals().get("websocket"):
+                        self.trade_websockets.pop(worker_id, None)
+
+    def _trade_worker_active(self, generation):
+        if self.stop_event.is_set():
+            return False
+
+        if self.shutdown_event is not None and self.shutdown_event.is_set():
+            return False
+
+        with self.lock:
+            return generation == self.trade_generation
+
+    @staticmethod
+    def _close_websockets(websockets):
+        for websocket in websockets:
+            try:
+                websocket.close()
+            except Exception as exc:
+                log_warning(f"Market flow websocket close warning: {exc}")
 
     def _start_book_streams(self):
         chunk_size = max(
@@ -191,37 +279,6 @@ class MarketFlowMonitor:
                     log_warning(f"Market flow book websocket reconnecting: {exc}")
                     self.stop_event.wait(3)
 
-    def _subscribe_locked(self):
-        if not self.twm:
-            return
-
-        streams = self._stream_names()
-        chunk_size = max(
-            int(getattr(config, "MARKET_FLOW_STREAMS_PER_SOCKET", 100)),
-            2,
-        )
-        self.socket_keys = []
-
-        for start in range(0, len(streams), chunk_size):
-            key = self.twm.start_futures_multiplex_socket(
-                callback=self.handle_message,
-                streams=streams[start:start + chunk_size],
-            )
-            self.socket_keys.append(key)
-
-    def _stop_manager_locked(self):
-        manager = self.twm
-        self.twm = None
-        self.socket_keys = []
-
-        if not manager:
-            return
-
-        try:
-            manager.stop()
-        except Exception as exc:
-            log_warning(f"Market flow websocket stop warning: {exc}")
-
     def reset_connection(self, reason):
         now = time.time()
         cooldown = max(
@@ -250,27 +307,27 @@ class MarketFlowMonitor:
         log_warning(f"Market flow websocket resetting | REASON={reason}")
 
         try:
-            from binance import ThreadedWebsocketManager
-
             with self.lock:
                 self.running = False
-                self._stop_manager_locked()
+                self.trade_generation += 1
+                websockets = list(self.trade_websockets.values())
+                self.trade_websockets = {}
+
+            self._close_websockets(websockets)
 
             if self.stop_event.wait(2):
                 return
 
-            manager = ThreadedWebsocketManager()
-            manager.start()
-
             with self.lock:
-                self.twm = manager
                 self.running = True
                 self.last_message_at = time.time()
                 self.last_trade_message_at = self.last_message_at
-                self._subscribe_locked()
+
+            self._start_trade_streams()
 
             log_info(
-                f"Market flow websocket restored | SOCKETS={len(self.socket_keys)}"
+                f"Market flow websocket restored | "
+                f"TRADE_SOCKETS={len(self.trade_threads)}"
             )
 
         except Exception as exc:
@@ -298,7 +355,7 @@ class MarketFlowMonitor:
         with self.lock:
             self.last_message_at = time.time()
 
-        if event_type == "aggTrade":
+        if event_type in {"aggTrade", "trade"}:
             self._handle_trade(data)
         elif event_type == "depthUpdate":
             self._handle_depth(data)
