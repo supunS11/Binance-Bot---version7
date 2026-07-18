@@ -376,7 +376,7 @@ class AdaptiveDcaLiveManagerTests(unittest.TestCase):
             config,
             "TP1_RUNNER_DISABLE_DCA",
             True,
-        ), patch.object(config, "DCA_MAX_ADVERSE_ROI", 150), patch.object(
+        ), patch.object(config, "DCA_MAX_ADVERSE_ROI", 0), patch.object(
             config,
             "DCA_MIN_SECONDS_BETWEEN_ORDERS",
             0,

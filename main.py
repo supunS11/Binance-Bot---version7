@@ -390,10 +390,16 @@ def log_live_guard_block(symbol, guard_info):
         f"{symbol} LIVE ENTRY BLOCKED | {reason} | "
         f"FAST={fast.get('label')} "
         f"SB={fast.get('structure_break')} "
-        f"REV={fast.get('opposite_reversal')} | "
+        f"REV={fast.get('opposite_reversal')} "
+        f"EMA_WRONG={fast.get('ema_wrong_side')} "
+        f"CHASE={fast.get('ema_chase_atr')}ATR "
+        f"SUPPORT={fast.get('support_score')} | "
         f"SLOW={slow.get('label')} "
         f"SB={slow.get('structure_break')} "
-        f"REV={slow.get('opposite_reversal')}"
+        f"REV={slow.get('opposite_reversal')} "
+        f"EMA_WRONG={slow.get('ema_wrong_side')} "
+        f"CHASE={slow.get('ema_chase_atr')}ATR "
+        f"SUPPORT={slow.get('support_score')}"
     )
 
 

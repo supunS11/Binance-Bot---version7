@@ -789,7 +789,7 @@ def _live_entry_timeframe_check(side, df, mark_price, label):
     retrace_atr = get_config_float("MAX_LIVE_ENTRY_RETRACE_ATR", 0.20)
     min_body_atr = get_config_float("LIVE_ENTRY_MIN_REVERSAL_BODY_ATR", 0.35)
     close_pos_limit = get_config_float("LIVE_ENTRY_REVERSAL_CLOSE_POSITION", 0.30)
-    max_chase_atr = get_config_float("MAX_LIVE_ENTRY_CHASE_ATR", 0.25)
+    max_chase_atr = get_config_float("MAX_LIVE_ENTRY_CHASE_ATR", 0.50)
     ema_tolerance_pct = get_config_float("LIVE_ENTRY_EMA_TOLERANCE_PCT", 0.08)
     max_close_position = get_config_float("MAX_LIVE_ENTRY_CLOSE_POSITION", 0.88)
     close_position = _close_position(latest)
