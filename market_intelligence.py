@@ -509,13 +509,16 @@ class MarketFlowMonitor:
             ),
             0,
         )
+        depth_fresh = depth_age is not None and depth_age <= stale_seconds
+        trade_fresh = trade_age is not None and trade_age <= stale_seconds
         weighted_parts = []
 
-        for window, weight in ((60, 0.5), (300, 0.3), (900, 0.2)):
-            ratio = ratios[window]
+        if trade_fresh:
+            for window, weight in ((60, 0.5), (300, 0.3), (900, 0.2)):
+                ratio = ratios[window]
 
-            if ratio is not None and notionals[window] >= minimum_notional:
-                weighted_parts.append((ratio, weight))
+                if ratio is not None and notionals[window] >= minimum_notional:
+                    weighted_parts.append((ratio, weight))
 
         weight_total = sum(weight for _, weight in weighted_parts)
         cvd_score = (
@@ -523,8 +526,6 @@ class MarketFlowMonitor:
             if weight_total > 0
             else 0.0
         )
-        depth_fresh = depth_age is not None and depth_age <= stale_seconds
-        trade_fresh = trade_age is not None and trade_age <= stale_seconds
         depth_component = depth_imbalance if depth_fresh else 0.0
         micro_scale = max(
             _safe_float(getattr(config, "MARKET_FLOW_MICROPRICE_SCALE_BPS", 2), 2),
@@ -542,9 +543,9 @@ class MarketFlowMonitor:
         )
         buy_score = round(directional * max_score, 3)
         components = {
-            "cvd_1m": ratios[60],
-            "cvd_5m": ratios[300],
-            "cvd_15m": ratios[900],
+            "cvd_1m": ratios[60] if trade_fresh else None,
+            "cvd_5m": ratios[300] if trade_fresh else None,
+            "cvd_15m": ratios[900] if trade_fresh else None,
             "depth": depth_component if depth_fresh else None,
             "microprice": micro_component if depth_fresh else None,
         }
@@ -569,10 +570,22 @@ class MarketFlowMonitor:
             "symbol": symbol,
             "buy_score": buy_score,
             "sell_score": round(-buy_score, 3),
-            "cvd_1m": None if ratios[60] is None else round(ratios[60], 4),
-            "cvd_5m": None if ratios[300] is None else round(ratios[300], 4),
-            "cvd_15m": None if ratios[900] is None else round(ratios[900], 4),
-            "notional_1m": round(notionals[60], 2),
+            "cvd_1m": (
+                round(ratios[60], 4)
+                if trade_fresh and ratios[60] is not None
+                else None
+            ),
+            "cvd_5m": (
+                round(ratios[300], 4)
+                if trade_fresh and ratios[300] is not None
+                else None
+            ),
+            "cvd_15m": (
+                round(ratios[900], 4)
+                if trade_fresh and ratios[900] is not None
+                else None
+            ),
+            "notional_1m": round(notionals[60], 2) if trade_fresh else 0,
             "depth_imbalance": round(depth_imbalance, 4) if depth_fresh else None,
             "microprice_bps": round(microprice_bps, 4) if depth_fresh else None,
             "buy_conflicts": buy_conflicts,

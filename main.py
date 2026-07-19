@@ -9,6 +9,7 @@ import config
 from binance.enums import SIDE_BUY, SIDE_SELL
 
 from exchange import (
+    sync_client_time,
     get_klines,
     get_balance,
     get_margin_balance,
@@ -28,6 +29,8 @@ from exchange import (
     set_margin_type,
     setup_leverage,
     get_entry_price,
+    get_reconciled_executed_quantity,
+    is_reconciled_execution_settled,
     validate_min_notional,
     cancel_open_protection_orders,
     cancel_algo_order,
@@ -105,6 +108,7 @@ _dca_locks = {}
 _dca_locks_guard = threading.Lock()
 shutdown_event = threading.Event()
 target_margin_stop_lock = threading.Lock()
+entry_quarantined_symbols = set()
 
 
 def wait_for_next_scan(reason="SCAN_COMPLETE"):
@@ -204,9 +208,12 @@ def prune_and_cleanup_closed_positions(trade_state, open_positions):
     for symbol in closed_symbols:
         if not cancel_open_protection_orders(symbol):
             cleanup_failed.add(symbol)
+            entry_quarantined_symbols.add(symbol)
             log_warning(
                 f"{symbol} closed-position protection cleanup incomplete"
             )
+        else:
+            entry_quarantined_symbols.discard(symbol)
 
     effective_open_positions = dict(open_positions or {})
 
@@ -589,13 +596,17 @@ def adopt_existing_position_state(state, symbol, position_detail):
         {"source": "ADOPTED_EXISTING_POSITION"}
     )
     item["adopted_existing"] = True
-    upsert_position_state(state, symbol, item)
+
+    if not upsert_position_state(state, symbol, item):
+        log_error(f"{symbol} existing position adoption state write failed")
+        return None
+
     log_warning(f"{symbol} existing position adopted into DCA state")
     return item
 
 
 def get_updated_position_after_fill(symbol, old_avg, old_quantity, fill_price, fill_quantity):
-    details = get_open_position_details(symbol)
+    details = get_open_position_details(symbol, force=True)
     position_detail = (details or {}).get(symbol)
 
     if position_detail:
@@ -616,6 +627,34 @@ def get_updated_position_after_fill(symbol, old_avg, old_quantity, fill_price, f
     ) / total_quantity
 
     return avg_entry, total_quantity, None
+
+
+def refresh_dca_position_before_order(symbol, side, expected_amount):
+    details = get_open_position_details(symbol, force=True)
+
+    if details is None:
+        return None, "POSITION_SNAPSHOT_UNAVAILABLE"
+
+    detail = details.get(symbol)
+
+    if not detail:
+        return None, "POSITION_CLOSED_DURING_DCA_CHECK"
+
+    live_amount = float(detail.get("amount", 0) or 0)
+    expected_amount = float(expected_amount or 0)
+    live_side = "BUY" if live_amount > 0 else "SELL" if live_amount < 0 else ""
+
+    if live_side != side:
+        return None, f"POSITION_SIDE_CHANGED_{live_side or 'FLAT'}"
+
+    tolerance = max(abs(expected_amount) * 1e-9, 1e-12)
+
+    if abs(live_amount - expected_amount) > tolerance:
+        return None, (
+            f"POSITION_QUANTITY_CHANGED_{expected_amount}_TO_{live_amount}"
+        )
+
+    return detail, "OK"
 
 
 def place_tp_sl_with_recovery(
@@ -1063,11 +1102,44 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
         log_warning(f"{symbol} DCA order skipped | bot shutdown requested")
         return
 
+    fresh_position, fresh_reason = refresh_dca_position_before_order(
+        symbol,
+        side,
+        position_detail.get("amount", 0),
+    )
+
+    if not fresh_position:
+        log_warning(f"{symbol} DCA aborted | {fresh_reason}")
+        return
+
+    position_detail = fresh_position
+    avg_entry = float(position_detail.get("entry_price", 0) or avg_entry)
+    old_quantity = abs(float(position_detail.get("amount", 0) or 0))
     order_side = SIDE_BUY if side == "BUY" else SIDE_SELL
-    order = place_market_order(symbol, order_side, quantity)
+    requested_quantity = quantity
+    order = place_market_order(
+        symbol,
+        order_side,
+        requested_quantity,
+        pre_position_amount=float(position_detail.get("amount", 0) or 0),
+        pre_average_price=avg_entry,
+        reference_price=current_price,
+        context="DCA_LEGACY",
+    )
 
     if not order:
         return
+
+    quantity = get_reconciled_executed_quantity(order, requested_quantity)
+
+    if quantity <= 0:
+        log_warning(f"{symbol} DCA aborted | no executed quantity confirmed")
+        return
+
+    filled_dca_margin = dca_margin * min(
+        quantity / max(requested_quantity, 1e-12),
+        1,
+    )
 
     fill_price = get_entry_price(symbol, order)
 
@@ -1088,7 +1160,7 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
         symbol,
         avg_entry,
         total_quantity,
-        dca_margin,
+        filled_dca_margin,
         fill_price,
         level_info,
         dca_count_increment=(
@@ -1424,17 +1496,74 @@ def manage_dca_position(
         )
         return
 
+    fresh_position, fresh_reason = refresh_dca_position_before_order(
+        symbol,
+        side,
+        position_detail.get("amount", 0),
+    )
+
+    if not fresh_position:
+        clear_dca_reservation(state, symbol, dca_level)
+        log_warning(f"{symbol} DCA aborted | {fresh_reason}")
+        return
+
+    position_detail = fresh_position
+    avg_entry = float(position_detail.get("entry_price", 0) or avg_entry)
+    old_quantity = abs(float(position_detail.get("amount", 0) or 0))
     order_side = SIDE_BUY if side == "BUY" else SIDE_SELL
+    requested_quantity = quantity
     log_info(
         f"{symbol} DCA placing market order | "
-        f"SIDE={order_side} | QTY={quantity} | MARGIN={dca_margin}"
+        f"SIDE={order_side} | QTY={requested_quantity} | MARGIN={dca_margin}"
     )
-    order = place_market_order(symbol, order_side, quantity)
+    order = place_market_order(
+        symbol,
+        order_side,
+        requested_quantity,
+        pre_position_amount=float(position_detail.get("amount", 0) or 0),
+        pre_average_price=avg_entry,
+        reference_price=current_price,
+        context=f"DCA_LEVEL_{dca_level}",
+    )
 
     if not order:
         clear_dca_reservation(state, symbol, dca_level)
         log_warning(f"{symbol} DCA aborted | market order failed")
         return
+
+    execution_settled = is_reconciled_execution_settled(order)
+
+    if not execution_settled:
+        log_error(
+            f"{symbol} DCA execution is not terminal | "
+            "multi-TP disabled for conservative full-position protection"
+        )
+        level_info["execution_status"] = "PENDING"
+        level_info["execution_client_order_ids"] = (
+            (order.get("_execution_reconciliation") or {}).get(
+                "client_order_ids",
+                "",
+            )
+        )
+
+    quantity = get_reconciled_executed_quantity(order, requested_quantity)
+
+    if quantity <= 0:
+        if execution_settled:
+            clear_dca_reservation(state, symbol, dca_level)
+        else:
+            log_error(
+                f"{symbol} DCA reservation retained | "
+                "execution status remains unknown"
+            )
+
+        log_warning(f"{symbol} DCA paused | no executed quantity confirmed")
+        return
+
+    filled_dca_margin = dca_margin * min(
+        quantity / max(requested_quantity, 1e-12),
+        1,
+    )
 
     fill_price = get_entry_price(symbol, order)
 
@@ -1455,7 +1584,7 @@ def manage_dca_position(
         symbol,
         avg_entry,
         total_quantity,
-        dca_margin,
+        filled_dca_margin,
         fill_price,
         level_info
     ):
@@ -1539,6 +1668,7 @@ def manage_dca_position(
                 ),
                 context_label=f"DCA_LEVEL_{dca_count + 1}",
                 enable_multi_tp=(
+                    execution_settled and
                     bool(getattr(config, "MULTI_TP_ENABLED", False)) and
                     position_state.get("multi_tp_stage") == TP1_PENDING
                 ),
@@ -1550,6 +1680,53 @@ def manage_dca_position(
 
             if not protection_ok:
                 log_warning(f"{symbol} DCA TP ORDER NOT CREATED")
+
+                if getattr(
+                    config,
+                    "PROTECTION_FAILURE_CLOSE_ENABLED",
+                    True,
+                ):
+                    live_details = get_open_position_details(
+                        symbol,
+                        force=True,
+                    )
+                    live_detail = (live_details or {}).get(symbol)
+                    live_amount = (
+                        float(live_detail.get("amount", 0) or 0)
+                        if live_detail
+                        else 0
+                    )
+                    closed = (
+                        close_position_market(
+                            symbol,
+                            live_amount,
+                            position_side=(
+                                live_detail.get("position_side")
+                                if live_detail
+                                else None
+                            ),
+                            reference_price=current_price,
+                            context="DCA_PROTECTION_FAILURE",
+                        )
+                        if live_amount
+                        else None
+                    )
+
+                    if closed:
+                        cancel_open_protection_orders(symbol)
+
+                    log_error(
+                        f"{symbol} DCA protection fail-safe close | "
+                        f"CONFIRMED={bool(closed)}"
+                    )
+                    send_telegram_message(
+                        f"{config.TELEGRAM_MESSAGE_PREFIX}\n"
+                        f"{symbol} DCA protection failed\n"
+                        f"Fail-safe close confirmed: {bool(closed)}"
+                    )
+
+                    if closed:
+                        return
         else:
             log_warning(
                 f"{symbol} DCA TP reprice skipped | "
@@ -1940,9 +2117,15 @@ def close_all_open_positions_for_target_stop():
             symbol = detail.get("symbol")
             amount = detail.get("amount", 0)
             position_side = detail.get("position_side")
-            cancel_open_protection_orders(symbol)
 
-            if close_position_market(symbol, amount, position_side=position_side):
+            if close_position_market(
+                symbol,
+                amount,
+                position_side=position_side,
+                reference_price=detail.get("mark_price"),
+                context="TARGET_MARGIN_EXIT",
+            ):
+                cancel_open_protection_orders(symbol)
                 log_warning(f"{symbol} target margin stop close submitted")
             else:
                 log_error(f"{symbol} target margin stop close failed")
@@ -3215,6 +3398,8 @@ class DcaWebsocketMonitor:
                 symbol,
                 amount,
                 position_side=position_side,
+                reference_price=mark_price,
+                context="EARLY_INVALIDATION_EXIT",
             )
 
             if closed:
@@ -3453,6 +3638,8 @@ class DcaWebsocketMonitor:
                 symbol,
                 amount,
                 position_side=position_side,
+                reference_price=mark_price,
+                context=f"{route}_PROFIT_EXIT",
             )
 
             if closed:
@@ -3891,6 +4078,13 @@ def execute_entry_candidate(
             log_warning(f"{symbol} entry skipped | bot shutdown requested")
             return position_details, open_positions, False
 
+        if symbol in entry_quarantined_symbols:
+            log_error(
+                f"{symbol} entry blocked | stale protection cleanup "
+                "is not confirmed"
+            )
+            return position_details, open_positions, False
+
         flow_blocked, flow_reason = market_flow_hard_veto(candidate)
 
         if flow_blocked:
@@ -3913,7 +4107,7 @@ def execute_entry_candidate(
             )
             return position_details, open_positions, False
 
-        latest_position_details = get_open_position_details()
+        latest_position_details = get_open_position_details(force=True)
 
         if latest_position_details is None:
             log_warning(
@@ -4274,10 +4468,38 @@ def execute_entry_candidate(
             return position_details, open_positions, False
 
         side = SIDE_BUY if signal == "BUY" else SIDE_SELL
-        order = place_market_order(symbol, side, quantity)
+        requested_quantity = quantity
+        order = place_market_order(
+            symbol,
+            side,
+            requested_quantity,
+            pre_position_amount=0,
+            pre_average_price=0,
+            reference_price=current_price,
+            context="ENTRY",
+        )
 
         if not order:
             return position_details, open_positions, False
+
+        execution_settled = is_reconciled_execution_settled(order)
+
+        if not execution_settled:
+            log_error(
+                f"{symbol} entry execution is not terminal | "
+                "multi-TP disabled for conservative full-position protection"
+            )
+
+        quantity = get_reconciled_executed_quantity(order, requested_quantity)
+
+        if quantity <= 0:
+            log_warning(f"{symbol} entry aborted | no executed quantity confirmed")
+            return position_details, open_positions, False
+
+        initial_margin = initial_margin * min(
+            quantity / max(requested_quantity, 1e-12),
+            1,
+        )
 
         entry_price = get_entry_price(symbol, order)
 
@@ -4323,6 +4545,7 @@ def execute_entry_candidate(
             signal_type=signal_type,
             context_label="ENTRY",
             enable_multi_tp=bool(
+                execution_settled and
                 getattr(config, "MULTI_TP_ENABLED", False)
             ),
             return_details=True
@@ -4331,6 +4554,42 @@ def execute_entry_candidate(
 
         if not protection_ok:
             log_warning(f"{symbol} TP ORDER NOT CREATED")
+
+            if getattr(config, "PROTECTION_FAILURE_CLOSE_ENABLED", True):
+                signed_amount = quantity if signal == "BUY" else -quantity
+                closed = close_position_market(
+                    symbol,
+                    signed_amount,
+                    reference_price=entry_price,
+                    context="ENTRY_PROTECTION_FAILURE",
+                )
+
+                if closed:
+                    cancel_open_protection_orders(symbol)
+                    log_error(
+                        f"{symbol} entry closed | protection creation failed"
+                    )
+                    send_telegram_message(
+                        f"{config.TELEGRAM_MESSAGE_PREFIX}\n"
+                        f"{symbol} entry closed: protection creation failed"
+                    )
+                    latest_position_details = get_open_position_details(
+                        force=True
+                    )
+
+                    if latest_position_details is not None:
+                        position_details = latest_position_details
+                        open_positions = get_open_position_amounts(
+                            latest_position_details
+                        )
+                        dca_monitor.sync(latest_position_details)
+
+                    return position_details, open_positions, False
+
+                log_error(
+                    f"{symbol} protection failed and emergency close "
+                    "was not confirmed"
+                )
 
         trade_times[symbol] = {
             "entry_time": datetime.now(),
@@ -4349,6 +4608,15 @@ def execute_entry_candidate(
         position_state["signal_type"] = signal_type or "UNKNOWN"
         position_state["confirmation_type"] = signal_type or "UNKNOWN"
         position_state["signal_id"] = signal_id
+        position_state["execution_status"] = (
+            "SETTLED" if execution_settled else "PENDING"
+        )
+        position_state["execution_client_order_ids"] = (
+            (order.get("_execution_reconciliation") or {}).get(
+                "client_order_ids",
+                "",
+            )
+        )
         position_state["signal_rank_score"] = candidate.get("rank_score")
         position_state["market_context"] = candidate.get("market_context") or {}
         position_state["tp_status"] = "CREATED" if protection_ok else "FAILED"
@@ -4367,7 +4635,44 @@ def execute_entry_candidate(
         position_state["tp_updated_at"] = datetime.now().isoformat(
             timespec="seconds"
         )
-        upsert_position_state(trade_state, symbol, position_state)
+        state_saved = upsert_position_state(
+            trade_state,
+            symbol,
+            position_state,
+        )
+
+        if not state_saved:
+            signed_amount = quantity if signal == "BUY" else -quantity
+            log_error(
+                f"{symbol} entry state persistence failed | "
+                "attempting fail-safe close"
+            )
+            closed = close_position_market(
+                symbol,
+                signed_amount,
+                reference_price=entry_price,
+                context="ENTRY_STATE_FAILURE",
+            )
+
+            if closed:
+                cancel_open_protection_orders(symbol)
+
+            send_telegram_message(
+                f"{config.TELEGRAM_MESSAGE_PREFIX}\n"
+                f"{symbol} state persistence failed\n"
+                f"Fail-safe close confirmed: {bool(closed)}"
+            )
+            latest_position_details = get_open_position_details(force=True)
+
+            if latest_position_details is not None:
+                position_details = latest_position_details
+                open_positions = get_open_position_amounts(
+                    latest_position_details
+                )
+                dca_monitor.sync(latest_position_details)
+
+            return position_details, open_positions, False
+
         append_signal_journal(
             symbol,
             final_analysis,
@@ -4411,7 +4716,7 @@ def execute_entry_candidate(
 
         open_positions[symbol] = quantity if signal == "BUY" else -quantity
         order_counts = get_open_position_counts(open_positions)
-        latest_position_details = get_open_position_details()
+        latest_position_details = get_open_position_details(force=True)
 
         if latest_position_details is not None:
             position_details = latest_position_details
@@ -4565,6 +4870,7 @@ def finalize_scanned_symbol(
 def run_bot():
 
     log_info("BOT STARTED")
+    sync_client_time()
     scan_symbols = get_scan_symbols()
     log_info(
         f"Scanning {len(scan_symbols)} symbols | "

@@ -166,7 +166,6 @@ def _cryptocompare_provider_items(cache, now):
 
     params = {
         "lang": "EN",
-        "api_key": config.NEWS_API_KEY,
     }
     headers = {
         "authorization": f"Apikey {config.NEWS_API_KEY}",
@@ -643,6 +642,12 @@ def apply_news_filter(symbol, side, analysis):
             return True, analysis, context
 
         log_warning(f"{symbol} NEWS unavailable | {reason}")
+        return True, analysis, context
+
+    if context.get("cache_status") == "stale":
+        context["action"] = "ALLOW"
+        context["reason"] = "NEWS_STALE_CACHE_ADVISORY_ONLY"
+        log_warning(f"{symbol} NEWS stale cache used as advisory only")
         return True, analysis, context
 
     score = float(context.get("score", 0) or 0)

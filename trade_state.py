@@ -154,15 +154,34 @@ def get_position_state(state, symbol):
 
 
 def upsert_position_state(state, symbol, data):
-    try:
-        with _state_file_lock():
-            latest_state = _load_trade_state_unlocked()
-            latest_state.setdefault("positions", {})[symbol] = data
-            _save_trade_state_unlocked(latest_state)
-            state["positions"] = latest_state.get("positions", {})
+    attempts = max(
+        int(getattr(config, "STATE_UPSERT_RETRY_ATTEMPTS", 3)),
+        1,
+    )
+    delay_seconds = max(
+        float(getattr(config, "STATE_UPSERT_RETRY_DELAY_SECONDS", 0.25)),
+        0,
+    )
 
-    except Exception as e:
-        log_error(f"{symbol} trade state upsert error: {e}")
+    for attempt in range(1, attempts + 1):
+        try:
+            with _state_file_lock():
+                latest_state = _load_trade_state_unlocked()
+                latest_state.setdefault("positions", {})[symbol] = data
+                _save_trade_state_unlocked(latest_state)
+                state["positions"] = latest_state.get("positions", {})
+            return True
+
+        except Exception as e:
+            log_error(
+                f"{symbol} trade state upsert error | "
+                f"ATTEMPT={attempt}/{attempts}: {e}"
+            )
+
+            if attempt < attempts and delay_seconds > 0:
+                time.sleep(delay_seconds)
+
+    return False
 
 
 def remove_position_state(state, symbol):

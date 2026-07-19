@@ -263,6 +263,48 @@ class MultiTpExchangeTests(unittest.TestCase):
         self.assertIsNone(result["tp_order"])
         cancel.assert_called_once_with("BTCUSDT", 123)
 
+    def test_rejected_sl_response_fails_and_cleans_up_tp(self):
+        with patch.object(config, "MULTI_TP_ENABLED", True), patch.object(
+            config,
+            "STATIC_TP_ENABLED",
+            True,
+        ), patch.object(config, "STATIC_TP_ROI", 20), patch(
+            "exchange.is_stop_loss_enabled_for_signal",
+            return_value=True,
+        ), patch(
+            "exchange.get_signal_stop_loss",
+            return_value=98,
+        ), patch(
+            "exchange.get_price_precision",
+            return_value=2,
+        ), patch(
+            "exchange.get_mark_price",
+            return_value=100,
+        ), patch(
+            "exchange.place_partial_take_profit",
+            return_value=({"algoId": 123}, 0.5),
+        ), patch(
+            "exchange.place_close_position_protection",
+            return_value={"algoStatus": "REJECTED"},
+        ), patch(
+            "exchange.cancel_algo_order",
+            return_value=True,
+        ) as cancel:
+            result = exchange.place_tp_sl(
+                "BTCUSDT",
+                exchange.SIDE_BUY,
+                100,
+                1,
+                None,
+                signal_type="TREND",
+                enable_multi_tp=True,
+                return_details=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["sl_created"])
+        cancel.assert_called_once_with("BTCUSDT", 123)
+
     def test_uncancelled_partial_tp_remains_tracked_and_blocks_retry(self):
         with patch.object(config, "MULTI_TP_ENABLED", True), patch.object(
             config,
@@ -309,6 +351,12 @@ class MultiTpExchangeTests(unittest.TestCase):
 
 
 class MultiTpMonitorTests(unittest.TestCase):
+    def setUp(self):
+        main.entry_quarantined_symbols.clear()
+
+    def tearDown(self):
+        main.entry_quarantined_symbols.clear()
+
     def test_recovery_does_not_retry_when_order_cleanup_is_unconfirmed(self):
         failed = {
             "ok": False,
@@ -376,6 +424,7 @@ class MultiTpMonitorTests(unittest.TestCase):
         cleanup.assert_called_once_with("BTCUSDT")
         prune.assert_called_once_with(state, {})
         self.assertEqual(removed, ["BTCUSDT"])
+        self.assertNotIn("BTCUSDT", main.entry_quarantined_symbols)
 
     def test_closed_position_state_is_retained_when_cleanup_must_retry(self):
         state = {
@@ -399,6 +448,7 @@ class MultiTpMonitorTests(unittest.TestCase):
         cleanup.assert_called_once_with("BTCUSDT")
         prune.assert_called_once_with(state, {"BTCUSDT": 0})
         self.assertEqual(removed, [])
+        self.assertIn("BTCUSDT", main.entry_quarantined_symbols)
 
     def test_confirmed_partial_fill_moves_state_to_runner_pending(self):
         monitor = main.DcaWebsocketMonitor()

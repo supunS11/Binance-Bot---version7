@@ -1315,6 +1315,16 @@ def apply_llm_filter(
         "reason": normalised["reason"],
     }
 
+    if "stale" in str(source or "").lower():
+        context["action"] = "ALLOW"
+        context["reason"] = "LLM_STALE_CACHE_ADVISORY_ONLY"
+        context["confidence_adjustment"] = 0
+        log_warning(
+            f"{symbol} LLM stale cache used as advisory only | "
+            f"SOURCE={source}"
+        )
+        return True, analysis, context
+
     log_info(
         f"{symbol} LLM | ACTION={context['action']} | "
         f"RISK={context['risk_label']} | ADJ={delta} | "

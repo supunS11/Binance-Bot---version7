@@ -15,6 +15,40 @@ with patch("binance.client.Client.ping", return_value={}), patch(
     import main
 
 
+class DcaPreSubmitReconciliationTests(unittest.TestCase):
+    def test_closed_position_aborts_dca_pre_submit_refresh(self):
+        with patch.object(main, "get_open_position_details", return_value={}):
+            detail, reason = main.refresh_dca_position_before_order(
+                "BTCUSDT",
+                "BUY",
+                1,
+            )
+
+        self.assertIsNone(detail)
+        self.assertEqual(reason, "POSITION_CLOSED_DURING_DCA_CHECK")
+
+    def test_changed_position_quantity_aborts_stale_dca_baseline(self):
+        with patch.object(
+            main,
+            "get_open_position_details",
+            return_value={
+                "BTCUSDT": {
+                    "amount": 0.75,
+                    "side": "BUY",
+                    "entry_price": 100,
+                },
+            },
+        ):
+            detail, reason = main.refresh_dca_position_before_order(
+                "BTCUSDT",
+                "BUY",
+                1,
+            )
+
+        self.assertIsNone(detail)
+        self.assertIn("POSITION_QUANTITY_CHANGED", reason)
+
+
 def market_frames(thesis_valid=True):
     if thesis_valid:
         trend_rows = [

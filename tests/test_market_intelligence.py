@@ -88,6 +88,30 @@ class MarketFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["cvd_1m"], 1.0)
         self.assertGreater(snapshot["buy_score"], 0)
 
+    def test_stale_trades_do_not_influence_fresh_book_score(self):
+        monitor = MarketFlowMonitor(["BTCUSDT"])
+        now = time.time()
+
+        with monitor.lock:
+            item = monitor.data["BTCUSDT"]
+            item["trades"].append((now - 30, 1000, 1000))
+            item["trade_updated_at"] = now - 30
+            item["depth_imbalance"] = 0
+            item["microprice_bps"] = 0
+            item["depth_updated_at"] = now
+
+        with patch("config.MARKET_FLOW_STALE_SECONDS", 15), patch(
+            "config.MARKET_FLOW_MIN_NOTIONAL_USDT",
+            0,
+        ):
+            snapshot = monitor.snapshot("BTCUSDT")
+
+        self.assertTrue(snapshot["available"])
+        self.assertIsNone(snapshot["cvd_1m"])
+        self.assertEqual(snapshot["notional_1m"], 0)
+        self.assertEqual(snapshot["buy_score"], 0)
+        self.assertEqual(snapshot["sell_score"], 0)
+
 
 class BreadthAndTransitionTests(unittest.TestCase):
     @staticmethod

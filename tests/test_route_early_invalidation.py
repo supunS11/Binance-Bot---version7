@@ -229,7 +229,13 @@ class RouteEarlyInvalidationMonitorTests(unittest.TestCase):
             )
 
         self.assertTrue(handled)
-        close.assert_called_once_with("TESTUSDT", 1.0, position_side="LONG")
+        close.assert_called_once_with(
+            "TESTUSDT",
+            1.0,
+            position_side="LONG",
+            reference_price=97.5,
+            context="EARLY_INVALIDATION_EXIT",
+        )
         cancel.assert_called_once_with("TESTUSDT")
         self.assertEqual(
             update.call_args.args[2]["early_invalidation_exit_status"],
