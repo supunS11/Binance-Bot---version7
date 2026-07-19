@@ -128,6 +128,15 @@ class MultiTpStateTests(unittest.TestCase):
 
 
 class MultiTpExchangeTests(unittest.TestCase):
+    def setUp(self):
+        self.trigger_price_patcher = patch.object(
+            exchange,
+            "normalize_trigger_price",
+            side_effect=lambda _symbol, _side, _order_type, price: float(price),
+        )
+        self.trigger_price_patcher.start()
+        self.addCleanup(self.trigger_price_patcher.stop)
+
     def test_partial_tp_is_quantity_based_and_reduce_only_in_one_way_mode(self):
         with patch.object(
             exchange,
@@ -483,6 +492,20 @@ class MultiTpMonitorTests(unittest.TestCase):
         ), patch(
             "main.update_position_runtime_fields",
             side_effect=apply_updates,
+        ), patch.object(
+            monitor,
+            "_multi_tp_retry_ready",
+            return_value=True,
+        ), patch.object(
+            monitor,
+            "_resolve_exact_tp1_fill",
+            return_value=(
+                True,
+                {
+                    "tp1_average_fill_price": 105,
+                    "algo_order": {"actualPrice": 105},
+                },
+            ),
         ), patch(
             "main.cancel_algo_order",
             return_value=True,
@@ -525,11 +548,15 @@ class MultiTpMonitorTests(unittest.TestCase):
         state = {"positions": {"BTCUSDT": position}}
 
         with patch("main.get_price_precision", return_value=2), patch(
-            "main.get_open_stop_loss_info",
-            return_value={},
+            "main.normalize_trigger_price",
+            side_effect=lambda _symbol, _side, _order_type, price: float(price),
         ), patch(
-            "main.get_open_take_profit_info",
-            return_value={},
+            "main.find_matching_open_algo_order",
+            return_value={"query_ok": True, "order_id": ""},
+        ), patch.object(
+            monitor,
+            "_validate_runner_order_id",
+            return_value="OPEN",
         ), patch(
             "main.place_close_position_protection",
             side_effect=[{"algoId": 22}, {"algoId": 33}],

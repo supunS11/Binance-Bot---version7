@@ -26,6 +26,8 @@ data/signal_outcomes*.csv
 data/signal_outcomes_pending*.json
 data/signal_calibration*.json
 data/execution_telemetry*.csv
+data/order_flow_shadow*.csv
+data/open_trades*.lock
 data/news_cache.json
 data/llm_cache.json
 

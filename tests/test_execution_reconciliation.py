@@ -24,6 +24,16 @@ def position(amount, entry_price=100, mark_price=100, position_side="BOTH"):
 
 
 class EntryReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        smart_execution = patch.object(
+            config,
+            "SMART_EXECUTION_ENABLED",
+            False,
+            create=True,
+        )
+        smart_execution.start()
+        self.addCleanup(smart_execution.stop)
+
     def common_patches(self, residual_retries=1):
         return (
             patch.object(config, "EXECUTION_RECONCILIATION_ENABLED", True),
@@ -147,8 +157,8 @@ class EntryReconciliationTests(unittest.TestCase):
             return_value=(None, "cancel status unavailable"),
         ), patch.object(
             exchange,
-            "_wait_for_position_reconciliation",
-            return_value=(True, None, 4),
+            "_execution_position_detail",
+            return_value=(True, None),
         ):
             order = exchange.place_market_order(
                 "BTCUSDT",
@@ -210,6 +220,12 @@ class EntryReconciliationTests(unittest.TestCase):
         self.assertEqual(submit.call_count, 1)
         self.assertEqual(
             order["_execution_reconciliation"]["executed_quantity"],
+            0.4,
+        )
+        self.assertEqual(
+            order["_execution_reconciliation"][
+                "observed_position_increase_quantity"
+            ],
             0.4,
         )
 
@@ -283,8 +299,8 @@ class EntryReconciliationTests(unittest.TestCase):
             return_value=(None, "cancel status unavailable"),
         ), patch.object(
             exchange,
-            "_wait_for_position_reconciliation",
-            return_value=(True, position(0.4), 1),
+            "_execution_position_detail",
+            return_value=(True, position(0.4)),
         ):
             order = exchange.place_market_order(
                 "BTCUSDT",
@@ -297,6 +313,12 @@ class EntryReconciliationTests(unittest.TestCase):
         self.assertEqual(submit.call_count, 1)
         self.assertEqual(
             order["_execution_reconciliation"]["executed_quantity"],
+            0,
+        )
+        self.assertEqual(
+            order["_execution_reconciliation"][
+                "observed_position_increase_quantity"
+            ],
             0.4,
         )
 
@@ -377,6 +399,17 @@ class EntryReconciliationTests(unittest.TestCase):
 
 
 class CloseReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        quantity_normalizer = patch.object(
+            exchange,
+            "normalize_order_quantity",
+            side_effect=lambda _symbol, quantity, **_kwargs: abs(
+                float(quantity)
+            ),
+        )
+        quantity_normalizer.start()
+        self.addCleanup(quantity_normalizer.stop)
+
     def test_partial_close_retries_residual_and_requires_flat_position(self):
         with patch.object(
             config,
@@ -388,29 +421,43 @@ class CloseReconciliationTests(unittest.TestCase):
             1,
         ), patch.object(
             exchange,
-            "_execution_position_detail",
-            return_value=(True, position(1, position_side="LONG")),
+            "_close_position_snapshot",
+            return_value=(
+                True,
+                position(1, position_side="LONG"),
+                "",
+            ),
         ), patch.object(
             exchange,
             "_submit_position_close_once",
             side_effect=[
                 (
-                    {"orderId": 31, "executedQty": "0.4", "cumQuote": "40"},
+                    {
+                        "orderId": 31,
+                        "status": "FILLED",
+                        "executedQty": "0.4",
+                        "cumQuote": "40",
+                    },
                     "SELL",
                     "LONG",
                 ),
                 (
-                    {"orderId": 32, "executedQty": "0.6", "cumQuote": "59.4"},
+                    {
+                        "orderId": 32,
+                        "status": "FILLED",
+                        "executedQty": "0.6",
+                        "cumQuote": "59.4",
+                    },
                     "SELL",
                     "LONG",
                 ),
             ],
         ) as submit, patch.object(
             exchange,
-            "_wait_for_position_reconciliation",
+            "_wait_for_close_position_reconciliation",
             side_effect=[
-                (True, position(0.6, position_side="LONG"), 1),
-                (True, None, 1),
+                (True, position(0.6, position_side="LONG"), 1, ""),
+                (True, None, 1, ""),
             ],
         ), patch.object(exchange, "append_execution_telemetry"):
             order = exchange.close_position_market(
@@ -436,20 +483,25 @@ class CloseReconciliationTests(unittest.TestCase):
             0,
         ), patch.object(
             exchange,
-            "_execution_position_detail",
-            return_value=(True, position(1)),
+            "_close_position_snapshot",
+            return_value=(True, position(1), ""),
         ), patch.object(
             exchange,
             "_submit_position_close_once",
             return_value=(
-                {"orderId": 41, "executedQty": "0.4", "cumQuote": "40"},
+                {
+                    "orderId": 41,
+                    "status": "FILLED",
+                    "executedQty": "0.4",
+                    "cumQuote": "40",
+                },
                 "SELL",
                 "BOTH",
             ),
         ), patch.object(
             exchange,
-            "_wait_for_position_reconciliation",
-            return_value=(True, position(0.6), 1),
+            "_wait_for_close_position_reconciliation",
+            return_value=(True, position(0.6), 1, ""),
         ), patch.object(exchange, "append_execution_telemetry") as journal:
             order = exchange.close_position_market(
                 "BTCUSDT",
@@ -499,6 +551,7 @@ class ExecutionTelemetryTests(unittest.TestCase):
                         99,
                     ),
                 })
+                execution_telemetry.flush_execution_telemetry()
 
             self.assertTrue(written)
 

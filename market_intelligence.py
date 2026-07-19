@@ -9,6 +9,10 @@ import config
 from logger import log_error, log_info, log_warning
 
 
+FUTURES_MARKET_STREAM_BASE = "wss://fstream.binance.com/market/stream?streams="
+FUTURES_PUBLIC_STREAM_BASE = "wss://fstream.binance.com/public/stream?streams="
+
+
 def _safe_float(value, default=0.0):
     try:
         return float(value)
@@ -29,10 +33,11 @@ def _message_data(message):
 
 
 class MarketFlowMonitor:
-    def __init__(self, symbols, shutdown_event=None):
+    def __init__(self, symbols, shutdown_event=None, shadow_monitor=None):
         self.enabled = bool(getattr(config, "MARKET_FLOW_ENABLED", True))
         self.symbols = tuple(dict.fromkeys(symbol.upper() for symbol in symbols))
         self.shutdown_event = shutdown_event
+        self.shadow_monitor = shadow_monitor
         self.running = False
         self.resetting = False
         self.last_message_at = 0.0
@@ -173,8 +178,8 @@ class MarketFlowMonitor:
     def _trade_stream_loop(self, symbols, generation):
         from websockets.sync.client import connect
 
-        streams = "/".join(f"{symbol.lower()}@trade" for symbol in symbols)
-        url = f"wss://fstream.binance.com/stream?streams={streams}"
+        streams = "/".join(f"{symbol.lower()}@aggTrade" for symbol in symbols)
+        url = f"{FUTURES_MARKET_STREAM_BASE}{streams}"
         worker_id = threading.get_ident()
 
         while self._trade_worker_active(generation):
@@ -252,7 +257,7 @@ class MarketFlowMonitor:
             f"{symbol.lower()}@bookTicker"
             for symbol in symbols
         )
-        url = f"wss://fstream.binance.com/stream?streams={streams}"
+        url = f"{FUTURES_PUBLIC_STREAM_BASE}{streams}"
 
         while not self.stop_event.is_set():
             if self.shutdown_event is not None and self.shutdown_event.is_set():
@@ -356,6 +361,14 @@ class MarketFlowMonitor:
             self.last_message_at = time.time()
 
         if event_type in {"aggTrade", "trade"}:
+            if self.shadow_monitor is not None:
+                try:
+                    self.shadow_monitor.handle_message(data)
+                except Exception as exc:
+                    log_warning(
+                        f"Shadow order-flow trade fanout warning: {exc}"
+                    )
+
             self._handle_trade(data)
         elif event_type == "depthUpdate":
             self._handle_depth(data)

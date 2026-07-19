@@ -1,13 +1,14 @@
 from colorama import Fore, init
 import logging
-import os
+from pathlib import Path
 
 init(autoreset=True)
 
-os.makedirs("logs", exist_ok=True)
+LOG_DIRECTORY = Path(__file__).resolve().parent / "logs"
+LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
-    filename='logs/bot.log',
+    filename=str(LOG_DIRECTORY / "bot.log"),
     level=logging.INFO,
     format='%(asctime)s - %(message)s'
 )
