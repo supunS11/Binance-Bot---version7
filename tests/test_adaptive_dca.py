@@ -353,6 +353,9 @@ class AdaptiveDcaBacktestTests(unittest.TestCase):
             "DCA_MIN_SECONDS_BETWEEN_ORDERS": 3600,
             "DCA_STRICT_GUARD_ENABLED": True,
             "DCA_REPRICE_TP_AFTER_FILL": False,
+            "DCA_FIXED_RISK_ENABLED": False,
+            "DCA_RECOVERY_CONFIRMATION_ENABLED": False,
+            "RISK_BASED_POSITION_SIZING_ENABLED": False,
             "BACKTEST_MAX_HOLD_CANDLES": 3,
             "MULTI_TP_ENABLED": False,
             "BACKTEST_MULTI_TP_ENABLED": False,
@@ -418,6 +421,14 @@ class AdaptiveDcaLiveManagerTests(unittest.TestCase):
             config,
             "DCA_TRIGGER_MODE",
             "adaptive_hybrid",
+        ), patch.object(
+            config,
+            "DCA_FIXED_RISK_ENABLED",
+            False,
+        ), patch.object(
+            config,
+            "DCA_RECOVERY_CONFIRMATION_ENABLED",
+            False,
         ), patch(
             "main.get_dca_order_margin",
             return_value=2,

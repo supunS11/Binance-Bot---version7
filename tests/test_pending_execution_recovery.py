@@ -205,9 +205,21 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
             side_effect=remove_in_memory,
         ) as remove_pending, patch(
             "main.fail_safe_close_unprotected_position",
-        ) as fail_safe_close, patch("main.log_warning"):
+        ) as fail_safe_close, patch(
+            "main._secure_pending_execution_protection",
+            return_value=True,
+        ) as secure_protection, patch(
+            "main.cancel_open_protection_orders",
+        ) as cancel_protection, patch("main.log_warning"):
             main.reconcile_pending_executions(state)
 
+        secure_protection.assert_called_once_with(
+            state,
+            SYMBOL,
+            pending,
+            unchanged_position,
+        )
+        cancel_protection.assert_not_called()
         clear_dca.assert_called_once_with(state, SYMBOL, 2)
         remove_pending.assert_called_once_with(state, SYMBOL)
         fail_safe_close.assert_not_called()
@@ -332,6 +344,47 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         place_order.assert_not_called()
         get_frames.assert_not_called()
 
+    def test_urgent_pending_execution_globally_pauses_other_symbol_dca(self):
+        other_symbol = "OTHERUSDT"
+        state = {
+            "positions": {
+                other_symbol: {
+                    "managed_by_bot": True,
+                    "campaign_risk_version": 2,
+                    "side": "BUY",
+                    "dca_count": 0,
+                },
+            },
+            "pending_executions": {SYMBOL: pending_execution()},
+        }
+        position_detail = {
+            "amount": 1.0,
+            "side": "BUY",
+            "position_side": "BOTH",
+            "entry_price": 100.0,
+        }
+
+        with patch.object(config, "DCA_ENABLED", True), patch.object(
+            main.shutdown_event,
+            "is_set",
+            return_value=False,
+        ), patch("main.place_market_order") as place_order, patch(
+            "main.reserve_dca_level",
+        ) as reserve, patch("main.get_signal_frames") as get_frames, patch(
+            "main.log_warning",
+        ):
+            main.manage_dca_position(
+                other_symbol,
+                state,
+                position_detail,
+                None,
+                None,
+            )
+
+        reserve.assert_not_called()
+        place_order.assert_not_called()
+        get_frames.assert_not_called()
+
     def test_unsettled_dca_persists_fresh_pre_order_position_amount(self):
         state = {
             "positions": {
@@ -340,6 +393,8 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
                     "side": "BUY",
                     "dca_count": 0,
                     "initial_entry": 100.0,
+                    "campaign_stop_price": 90.0,
+                    "hard_stop_price": 90.0,
                 },
             },
             "pending_executions": {},
@@ -369,6 +424,9 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
             "DCA_MAX_ADVERSE_ROI": 0,
             "DCA_MIN_SECONDS_BETWEEN_ORDERS": 0,
             "TP1_RUNNER_DISABLE_DCA": True,
+            "DCA_FIXED_RISK_ENABLED": False,
+            "DCA_RECOVERY_CONFIRMATION_ENABLED": False,
+            "RISK_BASED_POSITION_SIZING_ENABLED": False,
         }
         main_updates = {
             "get_dca_order_margin": Mock(return_value=10.0),
@@ -376,6 +434,11 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
             "get_dca_trigger_entry": Mock(return_value=100.0),
             "get_position_adverse_roi": Mock(return_value=2.0),
             "get_balance": Mock(return_value=1000.0),
+            "get_mark_price": Mock(return_value=98.0),
+            "load_trade_state": Mock(return_value=state),
+            "find_matching_close_position_stop": Mock(
+                return_value={"order_id": 55, "sl_price": 90.0}
+            ),
             "calculate_position_size": Mock(return_value=0.5),
             "validate_min_notional": Mock(return_value=(True, 49.0)),
             "set_margin_type": Mock(return_value=True),
@@ -391,6 +454,7 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
             "is_reconciled_execution_settled": Mock(return_value=False),
             "update_position_runtime_fields": Mock(return_value=True),
             "persist_pending_execution": Mock(return_value=True),
+            "reconcile_pending_executions": Mock(),
             "log_info": Mock(),
             "log_warning": Mock(),
             "log_error": Mock(),
@@ -423,6 +487,10 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(persist_call)
         self.assertEqual(persist_call.args[5], 1.25)
         self.assertEqual(persist_call.kwargs["dca_level"], 1)
+        self.assertEqual(persist_call.kwargs["pre_average_price"], 99.5)
+        main_updates["reconcile_pending_executions"].assert_called_once_with(
+            state
+        )
 
 
 class PendingExecutionStatePersistenceTests(unittest.TestCase):

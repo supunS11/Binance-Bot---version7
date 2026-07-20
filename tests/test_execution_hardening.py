@@ -74,6 +74,27 @@ def reconciled_market_order(
     }
 
 
+class ReconciledSettlementContractTests(unittest.TestCase):
+    def test_positive_fill_requires_verified_position_snapshot(self):
+        self.assertFalse(
+            exchange.is_reconciled_execution_settled(
+                reconciled_market_order(1.0, position_verified=False)
+            )
+        )
+        self.assertTrue(
+            exchange.is_reconciled_execution_settled(
+                reconciled_market_order(1.0, position_verified=True)
+            )
+        )
+
+    def test_terminal_zero_fill_is_settled_without_position_snapshot(self):
+        self.assertTrue(
+            exchange.is_reconciled_execution_settled(
+                reconciled_market_order(0.0, position_verified=False)
+            )
+        )
+
+
 class PositionModeVerificationTests(unittest.TestCase):
     def test_one_way_mode_requires_an_explicit_false_value(self):
         responses = (

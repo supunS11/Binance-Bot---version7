@@ -139,6 +139,9 @@ class TrendProfitProtectionTests(unittest.TestCase):
         }
 
         with patch(
+            "main.load_trade_state",
+            return_value=state,
+        ), patch(
             "main.get_open_position_details",
             return_value={
                 "BTCUSDT": {

@@ -17,8 +17,10 @@ from strategy import (
     analyze_signal,
     evaluate_route_early_invalidation,
     evaluate_route_profit_protection,
+    evaluate_time_exit_weakness,
     validate_adverse_zone_level,
     validate_dca_continuation_guard,
+    validate_dca_recovery_confirmation,
     validate_entry_profit_room,
     validate_structure_take_profit,
 )
@@ -838,11 +840,17 @@ def simulate_trade(
     dca_count = 0
     max_hold = int(getattr(config, "BACKTEST_MAX_HOLD_CANDLES", 240))
     signal_entry_df = frames["entry"].indicators
+    fast_frame = frames.get("fast") or frames["entry"]
+    slow_frame = frames.get("slow") or frames["confirm"]
+    fast_signal_df = fast_frame.indicators
+    slow_signal_df = slow_frame.indicators
     exit_frame = frames.get("exit") or frames["entry"]
     exit_df = exit_frame.indicators
     trend_interval = config.TREND_TIMEFRAME
     confirm_interval = config.CONFIRMATION_TIMEFRAME
     entry_interval = config.ENTRY_TIMEFRAME
+    fast_interval = config.LIVE_ENTRY_FAST_TIMEFRAME
+    slow_interval = config.LIVE_ENTRY_SLOW_TIMEFRAME
     decision_trend = closed_slice(
         frames["trend"].indicators,
         int(entry_time),
@@ -881,6 +889,80 @@ def simulate_trade(
         decision_confirm,
         confirmation_type,
     )
+    entry_stop_distance_roi = (
+        (
+            ((entry_price - sl_price) / entry_price) *
+            float(config.LEVERAGE) * 100
+            if side == "BUY"
+            else ((sl_price - entry_price) / entry_price) *
+            float(config.LEVERAGE) * 100
+        )
+        if sl_price is not None and entry_price > 0
+        else 0
+    )
+    recovery_required_stop_roi = (
+        float(config.DCA_TRIGGER_ROIS[0]) +
+        max(float(getattr(config, "DCA_MIN_HARD_STOP_BUFFER_ROI", 0)), 0)
+        if (
+            getattr(config, "BACKTEST_USE_DCA", False) and
+            config.DCA_ENABLED and
+            config.DCA_TRIGGER_ROIS
+        )
+        else 0
+    )
+    recovery_planned = bool(
+        getattr(config, "BACKTEST_USE_DCA", False) and
+        config.DCA_ENABLED and
+        getattr(config, "DCA_FIXED_RISK_ENABLED", False) and
+        entry_stop_distance_roi >= recovery_required_stop_roi
+    )
+
+    if (
+        getattr(config, "BACKTEST_USE_DCA", False) and
+        config.DCA_ENABLED and
+        getattr(config, "DCA_FIXED_RISK_ENABLED", False) and
+        not recovery_planned
+    ):
+        fills[0]["margin"] = float(config.MARGIN_PER_TRADE)
+        fills[0]["qty"] = (
+            fills[0]["margin"] * float(config.LEVERAGE) / entry_price
+        )
+
+    campaign_risk_budget = 0.0
+
+    if (
+        getattr(config, "RISK_BASED_POSITION_SIZING_ENABLED", False) and
+        sl_price is not None
+    ):
+        campaign_risk_budget = (
+            float(getattr(config, "BACKTEST_INITIAL_BALANCE", 1000)) *
+            max(float(getattr(config, "POSITION_RISK_PCT", 0)), 0) /
+            100
+        )
+        max_risk = max(
+            float(getattr(config, "POSITION_RISK_MAX_USDT", 0)),
+            0,
+        )
+
+        if max_risk > 0:
+            campaign_risk_budget = min(campaign_risk_budget, max_risk)
+
+        initial_risk_budget = campaign_risk_budget * (
+            max(float(getattr(config, "DCA_INITIAL_RISK_PCT", 70)), 0) /
+            100
+            if recovery_planned
+            else 1
+        )
+        risk_quantity = initial_risk_budget / max(
+            abs(entry_price - sl_price),
+            1e-12,
+        )
+        fills[0]["qty"] = min(fills[0]["qty"], risk_quantity)
+        fills[0]["margin"] = (
+            fills[0]["qty"] * entry_price / max(float(config.LEVERAGE), 1)
+        )
+        avg_entry = position_average_entry(fills)
+
     max_seen_adverse_roi = 0.0
     max_seen_favorable_roi = 0.0
     profit_protection_peak_roi = 0.0
@@ -892,6 +974,11 @@ def simulate_trade(
     dca_blocked_count = 0
     last_dca_block_reason = ""
     early_invalidation_reason = ""
+    time_exit_reason = ""
+    recovery_armed = False
+    recovery_disabled = False
+    recovery_extreme_price = None
+    recovery_armed_time = None
 
     exit_times = exit_df["time"].to_numpy()
     start_index = exit_times.searchsorted(int(entry_time), side="left")
@@ -907,8 +994,28 @@ def simulate_trade(
     for row_index in range(start_index, end_index):
         candle = exit_df.iloc[row_index]
         candle_time = int(candle["time"])
+        candle_close_decision_ms = int(candle["close_time"]) + 1
+        dca_filled_this_candle = False
 
-        if getattr(config, "EARLY_FLOW_EXIT_ENABLED", False):
+        # Conservative intrabar ordering: an exchange hard stop always wins
+        # before any software exit or recovery add. Gap-through exits use the
+        # adverse candle open rather than the configured trigger price.
+        if candle_hits_sl(side, candle, sl_price):
+            candle_open = float(candle["open"])
+            stop_fill = (
+                min(candle_open, sl_price)
+                if side == "BUY"
+                else max(candle_open, sl_price)
+            )
+            exit_price = apply_exit_slippage(side, stop_fill)
+            exit_candle = candle
+            exit_reason = "RUNNER_SL" if tp1_hit else "SL"
+            break
+
+        if (
+            not tp1_hit and
+            getattr(config, "EARLY_FLOW_EXIT_ENABLED", False)
+        ):
             route = (
                 "REVERSAL"
                 if str(confirmation_type or "").upper() == "REVERSAL"
@@ -959,15 +1066,15 @@ def simulate_trade(
                 current_roi <= route_max_roi
             ):
                 fast_slice = closed_slice(
-                    signal_entry_df,
+                    fast_signal_df,
                     candle_time,
-                    entry_interval,
+                    fast_interval,
                     min_rows=40,
                 )
                 slow_slice = closed_slice(
-                    frames["confirm"].indicators,
+                    slow_signal_df,
                     candle_time,
-                    confirm_interval,
+                    slow_interval,
                     min_rows=40,
                 )
                 early_info = evaluate_route_early_invalidation(
@@ -976,6 +1083,7 @@ def simulate_trade(
                     slow_slice,
                     current_price,
                     confirmation_type=route,
+                    reference_price=entry_price,
                 )
 
                 if early_info.get("should_exit"):
@@ -990,7 +1098,74 @@ def simulate_trade(
                     )
                     break
 
+        if not tp1_hit and getattr(config, "TIME_EXIT_ENABLED", False):
+            route = (
+                "REVERSAL"
+                if str(confirmation_type or "").upper() == "REVERSAL"
+                else "TREND"
+            )
+            route_enabled = bool(
+                getattr(config, f"TIME_EXIT_{route}_ENABLED", route == "TREND")
+            )
+            elapsed_minutes = (candle_time - int(entry_time)) / 60_000
+            post_dca_grace_minutes = max(
+                float(getattr(config, "TIME_EXIT_POST_DCA_GRACE_MINUTES", 0)),
+                0,
+            )
+            post_dca_grace_complete = bool(
+                dca_count <= 0 or
+                post_dca_grace_minutes <= 0 or
+                candle_time - int(fills[-1]["time"]) >=
+                post_dca_grace_minutes * 60_000
+            )
+            current_price = float(candle["open"])
+            current_roi = (
+                ((current_price - avg_entry) / avg_entry) *
+                float(config.LEVERAGE) * 100
+                if side == "BUY"
+                else ((avg_entry - current_price) / avg_entry) *
+                float(config.LEVERAGE) * 100
+            )
+
+            if (
+                route_enabled and
+                elapsed_minutes >= max(float(config.TIME_EXIT_MINUTES), 0) and
+                post_dca_grace_complete and
+                current_roi <= min(float(config.TIME_EXIT_MAX_ROI), 0)
+            ):
+                trend_slice = closed_slice(
+                    frames["trend"].indicators,
+                    candle_time,
+                    trend_interval,
+                )
+                confirm_slice = closed_slice(
+                    frames["confirm"].indicators,
+                    candle_time,
+                    confirm_interval,
+                )
+                weakness = evaluate_time_exit_weakness(
+                    side,
+                    trend_slice,
+                    confirm_slice,
+                )
+                should_exit = (
+                    weakness.get("should_exit")
+                    if getattr(config, "TIME_EXIT_REQUIRE_WEAKNESS", True)
+                    else True
+                )
+
+                if should_exit:
+                    exit_price = apply_exit_slippage(side, current_price)
+                    exit_candle = candle
+                    exit_time_override = candle_time
+                    exit_reason = f"{route}_TIME_EXIT"
+                    time_exit_reason = weakness.get("reason", "")
+                    break
+
         while not tp1_hit:
+            if recovery_disabled:
+                break
+
             trigger_roi = dca_trigger_roi(dca_count)
             next_margin = dca_margin(dca_count)
 
@@ -1005,26 +1180,176 @@ def simulate_trade(
             if cooldown_ms and candle_time - int(fills[-1]["time"]) < cooldown_ms:
                 break
 
+            trigger_anchor_price = fills[0]["price"]
+            spacing_anchor_price = fills[-1]["price"]
             max_adverse_roi = max(
                 float(getattr(config, "DCA_MAX_ADVERSE_ROI", 0)),
                 0,
             )
 
-            if max_adverse_roi and trigger_roi > max_adverse_roi:
+            adverse_extreme_price = (
+                float(candle["low"])
+                if side == "BUY"
+                else float(candle["high"])
+            )
+            actual_adverse_roi = abs(
+                ((trigger_anchor_price - adverse_extreme_price) /
+                 trigger_anchor_price) * float(config.LEVERAGE) * 100
+                if side == "BUY"
+                else ((adverse_extreme_price - trigger_anchor_price) /
+                      trigger_anchor_price) * float(config.LEVERAGE) * 100
+            )
+
+            if max_adverse_roi and actual_adverse_roi > max_adverse_roi:
                 dca_blocked_count += 1
                 last_dca_block_reason = "DCA_MAX_RISK_EXCEEDED"
+                recovery_armed = False
+                recovery_disabled = True
                 break
 
-            trigger_anchor_price = fills[0]["price"]
-            spacing_anchor_price = fills[-1]["price"]
             trigger_price = dca_trigger_price(
                 side,
                 trigger_anchor_price,
                 trigger_roi,
             )
 
-            if not candle_hits_dca(side, candle, trigger_price):
-                break
+            trigger_hit = candle_hits_dca(side, candle, trigger_price)
+            recovery_mode = bool(
+                getattr(config, "DCA_RECOVERY_CONFIRMATION_ENABLED", False)
+            )
+
+            if recovery_mode:
+                adverse_price = (
+                    float(candle["low"])
+                    if side == "BUY"
+                    else float(candle["high"])
+                )
+
+                if not recovery_armed:
+                    if not trigger_hit:
+                        break
+
+                    recovery_armed = True
+                    recovery_extreme_price = adverse_price
+                    recovery_armed_time = candle_time
+                    last_dca_block_reason = "DCA_RECOVERY_ARMED"
+                    break
+
+                arm_timeout_ms = max(
+                    float(
+                        getattr(
+                            config,
+                            "DCA_RECOVERY_ARM_TIMEOUT_MINUTES",
+                            240,
+                        )
+                    ),
+                    0,
+                ) * 60_000
+
+                if (
+                    arm_timeout_ms and
+                    recovery_armed_time is not None and
+                    candle_time - recovery_armed_time > arm_timeout_ms
+                ):
+                    recovery_armed = False
+                    recovery_disabled = True
+                    dca_blocked_count += 1
+                    last_dca_block_reason = "DCA_RECOVERY_ARM_TIMEOUT"
+                    break
+
+                if side == "BUY":
+                    recovery_extreme_price = min(
+                        float(recovery_extreme_price),
+                        adverse_price,
+                    )
+                    rebound_move = float(candle["close"]) - recovery_extreme_price
+                else:
+                    recovery_extreme_price = max(
+                        float(recovery_extreme_price),
+                        adverse_price,
+                    )
+                    rebound_move = recovery_extreme_price - float(candle["close"])
+
+                rebound_roi = (
+                    max(rebound_move, 0) /
+                    max(float(recovery_extreme_price), 1e-12) *
+                    float(config.LEVERAGE) * 100
+                )
+
+                if rebound_roi < max(
+                    float(getattr(config, "DCA_RECOVERY_MIN_REBOUND_ROI", 5)),
+                    0,
+                ):
+                    last_dca_block_reason = "DCA_RECOVERY_REBOUND_INCOMPLETE"
+                    break
+
+                candidate_fill_price = float(candle["close"])
+
+                recovery_price_gap_roi = abs(
+                    ((trigger_anchor_price - candidate_fill_price) /
+                     trigger_anchor_price) * float(config.LEVERAGE) * 100
+                    if side == "BUY"
+                    else ((candidate_fill_price - trigger_anchor_price) /
+                          trigger_anchor_price) * float(config.LEVERAGE) * 100
+                )
+                minimum_price_gap_roi = max(
+                    float(getattr(config, "DCA_MIN_PRICE_GAP_ROI", 0)),
+                    0,
+                )
+
+                if recovery_price_gap_roi < minimum_price_gap_roi:
+                    dca_blocked_count += 1
+                    last_dca_block_reason = "DCA_RECOVERY_PRICE_GAP_TOO_SMALL"
+                    break
+
+                fast_slice = closed_slice(
+                    fast_signal_df,
+                    candle_close_decision_ms,
+                    fast_interval,
+                    min_rows=40,
+                )
+                slow_slice = closed_slice(
+                    slow_signal_df,
+                    candle_close_decision_ms,
+                    slow_interval,
+                    min_rows=40,
+                )
+                recovery_ok, recovery_info = validate_dca_recovery_confirmation(
+                    side,
+                    fast_slice,
+                    slow_slice,
+                    candidate_fill_price,
+                )
+
+                if not recovery_ok:
+                    dca_blocked_count += 1
+                    last_dca_block_reason = recovery_info.get(
+                        "reason",
+                        "DCA_RECOVERY_NOT_CONFIRMED",
+                    )
+                    break
+            else:
+                if not trigger_hit:
+                    break
+
+                candidate_fill_price = trigger_price
+
+            if sl_price is not None:
+                stop_buffer_roi = (
+                    ((candidate_fill_price - sl_price) / candidate_fill_price) *
+                    float(config.LEVERAGE) * 100
+                    if side == "BUY"
+                    else ((sl_price - candidate_fill_price) / candidate_fill_price) *
+                    float(config.LEVERAGE) * 100
+                )
+
+                if stop_buffer_roi < max(
+                    float(getattr(config, "DCA_MIN_HARD_STOP_BUFFER_ROI", 0)),
+                    0,
+                ):
+                    dca_blocked_count += 1
+                    last_dca_block_reason = "DCA_HARD_STOP_BUFFER_TOO_SMALL"
+                    break
 
             if (
                 getattr(config, "DCA_STRICT_GUARD_ENABLED", True) or
@@ -1033,29 +1358,36 @@ def simulate_trade(
             ):
                 trend_slice = closed_slice(
                     frames["trend"].indicators,
-                    candle_time,
+                    candle_close_decision_ms,
                     trend_interval,
                 )
                 confirm_slice = closed_slice(
                     frames["confirm"].indicators,
-                    candle_time,
+                    candle_close_decision_ms,
                     confirm_interval,
                 )
                 entry_slice = closed_slice(
                     signal_entry_df,
-                    candle_time,
+                    candle_close_decision_ms,
                     entry_interval,
                 )
                 position_adverse_roi = abs(
-                    ((avg_entry - trigger_price) / avg_entry) *
+                    ((avg_entry - candidate_fill_price) / avg_entry) *
                     float(config.LEVERAGE) * 100
                     if side == "BUY"
-                    else ((trigger_price - avg_entry) / avg_entry) *
+                    else ((candidate_fill_price - avg_entry) / avg_entry) *
                     float(config.LEVERAGE) * 100
+                )
+                candidate_adverse_roi = abs(
+                    ((trigger_anchor_price - candidate_fill_price) /
+                     trigger_anchor_price) * float(config.LEVERAGE) * 100
+                    if side == "BUY"
+                    else ((candidate_fill_price - trigger_anchor_price) /
+                          trigger_anchor_price) * float(config.LEVERAGE) * 100
                 )
                 guard_ok, guard_info = validate_dca_continuation_guard(
                     side,
-                    trigger_price,
+                    candidate_fill_price,
                     avg_entry,
                     trend_slice,
                     confirm_slice,
@@ -1063,7 +1395,7 @@ def simulate_trade(
                     leverage=config.LEVERAGE,
                     confirmation_type=confirmation_type,
                     dca_level=dca_count + 1,
-                    adverse_roi=trigger_roi,
+                    adverse_roi=round(float(candidate_adverse_roi), 2),
                     position_adverse_roi=round(float(position_adverse_roi), 2),
                     trigger_roi=trigger_roi,
                     spacing_anchor_price=spacing_anchor_price,
@@ -1077,14 +1409,43 @@ def simulate_trade(
                     )
                     break
 
-            fill_price = apply_entry_slippage(side, trigger_price)
+            fill_price = apply_entry_slippage(side, candidate_fill_price)
+            fill_quantity = (next_margin * float(config.LEVERAGE)) / fill_price
+
+            if campaign_risk_budget > 0 and sl_price is not None:
+                existing_risk = sum(
+                    item["qty"] * abs(item["price"] - sl_price)
+                    for item in fills
+                )
+                recovery_cap = campaign_risk_budget * max(
+                    float(getattr(config, "DCA_RECOVERY_RISK_PCT", 30)),
+                    0,
+                ) / 100
+                remaining_risk = min(
+                    max(campaign_risk_budget - existing_risk, 0),
+                    recovery_cap,
+                )
+                fill_quantity = min(
+                    fill_quantity,
+                    remaining_risk / max(abs(fill_price - sl_price), 1e-12),
+                )
+
+            if fill_quantity <= 0:
+                dca_blocked_count += 1
+                last_dca_block_reason = "DCA_FIXED_RISK_EXHAUSTED"
+                break
+
             fills.append({
-                "time": candle_time,
+                "time": candle_close_decision_ms,
                 "price": fill_price,
-                "margin": next_margin,
-                "qty": (next_margin * float(config.LEVERAGE)) / fill_price,
+                "margin": (
+                    fill_quantity * fill_price / max(float(config.LEVERAGE), 1)
+                ),
+                "qty": fill_quantity,
             })
             dca_count += 1
+            dca_filled_this_candle = True
+            recovery_armed = False
             avg_entry = position_average_entry(fills)
             profit_protection_peak_roi = 0.0
             profit_protection_floor_roi = 0.0
@@ -1092,12 +1453,12 @@ def simulate_trade(
             if getattr(config, "DCA_REPRICE_TP_AFTER_FILL", True):
                 trend_slice = closed_slice(
                     frames["trend"].indicators,
-                    candle_time,
+                    candle_close_decision_ms,
                     trend_interval,
                 )
                 confirm_slice = closed_slice(
                     frames["confirm"].indicators,
-                    candle_time,
+                    candle_close_decision_ms,
                     confirm_interval,
                 )
 
@@ -1112,18 +1473,21 @@ def simulate_trade(
                     )
                     tp1_price = float(tp_price)
                     tp1_mode = tp_mode
-                    sl_price, sl_mode = compute_stop_loss(
-                        side,
-                        avg_entry,
-                        confirm_slice,
-                        confirmation_type,
-                    )
+                    # The campaign hard stop is immutable. DCA may reprice the
+                    # target from the new average, but it must never loosen or
+                    # replace the original exchange risk boundary.
 
             if (
                 getattr(config, "DCA_TRIGGER_MODE", "static_roi") ==
                 "adaptive_hybrid"
             ):
                 break
+
+        if dca_filled_this_candle:
+            # The recovery order is modeled at this candle's close. Its new
+            # quantity cannot profit from high/low extrema that occurred
+            # earlier in the same candle.
+            continue
 
         adverse_price = float(candle["low"]) if side == "BUY" else float(candle["high"])
         adverse_roi = abs(
@@ -1161,29 +1525,26 @@ def simulate_trade(
             if str(confirmation_type or "").upper() == "REVERSAL"
             else "TREND"
         )
-        profit_info = evaluate_route_profit_protection(
-            side,
-            avg_entry,
-            favorable_price,
-            peak_roi=profit_protection_peak_roi,
-            leverage=config.LEVERAGE,
-            confirmation_type=route,
-        )
-        profit_protection_peak_roi = max(
-            profit_protection_peak_roi,
-            float(profit_info.get("peak_roi", 0) or 0),
-        )
-        profit_protection_floor_roi = float(
-            profit_info.get("floor_roi", 0) or 0
-        )
+        if tp1_hit:
+            profit_info = {"armed": False}
+        else:
+            profit_info = evaluate_route_profit_protection(
+                side,
+                avg_entry,
+                favorable_price,
+                peak_roi=profit_protection_peak_roi,
+                leverage=config.LEVERAGE,
+                confirmation_type=route,
+            )
+            profit_protection_peak_roi = max(
+                profit_protection_peak_roi,
+                float(profit_info.get("peak_roi", 0) or 0),
+            )
+            profit_protection_floor_roi = float(
+                profit_info.get("floor_roi", 0) or 0
+            )
 
-        if candle_hits_sl(side, candle, sl_price):
-            exit_price = apply_exit_slippage(side, sl_price)
-            exit_candle = candle
-            exit_reason = "RUNNER_SL" if tp1_hit else "SL"
-            break
-
-        if profit_info.get("armed"):
+        if not tp1_hit and profit_info.get("armed"):
             profit_floor_price = roi_to_price(
                 side,
                 avg_entry,
@@ -1349,6 +1710,11 @@ def simulate_trade(
         "dca_blocked_count": dca_blocked_count,
         "last_dca_block_reason": last_dca_block_reason,
         "early_invalidation_reason": early_invalidation_reason,
+        "time_exit_reason": time_exit_reason,
+        "campaign_risk_budget_usdt": round(campaign_risk_budget, 4),
+        "recovery_armed_at_data_end": bool(recovery_armed),
+        "recovery_disabled_at_data_end": bool(recovery_disabled),
+        "recovery_planned": bool(recovery_planned),
     }
 
 
@@ -1769,6 +2135,8 @@ def load_symbol_frames(symbol, args, start_ms, end_ms):
         "confirm": config.CONFIRMATION_TIMEFRAME,
         "entry": config.ENTRY_TIMEFRAME,
         "exit": getattr(config, "BACKTEST_EXIT_TIMEFRAME", config.ENTRY_TIMEFRAME),
+        "fast": config.LIVE_ENTRY_FAST_TIMEFRAME,
+        "slow": config.LIVE_ENTRY_SLOW_TIMEFRAME,
     }
     frames = {}
     loaded_by_interval = {}

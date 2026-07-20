@@ -396,6 +396,12 @@ def update_position_tp_status(state, symbol, tp_info, context=""):
 
                 if "sl_created" in tp_info or "sl_enabled" in tp_info:
                     sl_created = bool(tp_info.get("sl_created"))
+                    sl_order = tp_info.get("sl_order") or {}
+                    sl_order_id = (
+                        sl_order.get("algoId") or
+                        sl_order.get("orderId") or
+                        ""
+                    )
                     item["sl_status"] = (
                         "CREATED" if sl_created else "DISABLED"
                     )
@@ -403,7 +409,15 @@ def update_position_tp_status(state, symbol, tp_info, context=""):
                     item["sl_price"] = tp_info.get("sl_price")
                     item["sl_source"] = context
 
+                    if sl_created:
+                        item["hard_stop_price"] = tp_info.get("sl_price")
+                        item["hard_stop_order_id"] = sl_order_id
+
                 apply_multi_tp_protection_state(item, tp_info)
+
+                if ok and str(context or "").upper().startswith("DCA_LEVEL_"):
+                    item["tp_reprice_status"] = "COMPLETE"
+                    item["tp_reprice_completed_at"] = now_iso()
 
                 latest_state.setdefault("positions", {})[symbol] = item
                 _save_trade_state_unlocked(latest_state)
@@ -563,8 +577,31 @@ def _record_dca_fill_once(
 
             item["last_dca_price"] = dca_price
             item["last_dca_at"] = now_iso()
+            if getattr(config, "DCA_FIXED_RISK_ENABLED", False):
+                item["dca_recovery_status"] = "FILLED"
+                item["dca_recovery_disabled"] = True
+                item["dca_recovery_disabled_reason"] = "RECOVERY_ADD_CONSUMED"
+
+                if getattr(config, "DCA_REPRICE_TP_AFTER_FILL", True):
+                    item["tp_reprice_status"] = "PENDING"
+                    item["tp_reprice_pending_at"] = now_iso()
+                    item["tp_reprice_avg_entry"] = avg_entry
+                    item["tp_reprice_quantity"] = quantity
+                    item["tp_reprice_hard_stop_price"] = (
+                        (level_info or {}).get("hard_stop_price") or
+                        item.get("campaign_stop_price")
+                    )
             item["updated_at"] = now_iso()
             item.pop("pending_dca", None)
+
+            if getattr(config, "DCA_FIXED_RISK_ENABLED", False):
+                for field in (
+                    "dca_recovery_arm_price",
+                    "dca_recovery_extreme_price",
+                    "dca_recovery_extreme_at",
+                    "dca_recovery_peak_adverse_roi",
+                ):
+                    item.pop(field, None)
 
             # A DCA fill changes the ROI basis, so route profit peaks must
             # restart from the new average entry.
@@ -633,6 +670,12 @@ def _pending_dca_is_active(pending):
     if pending.get("execution_unsettled"):
         return True
 
+    # A fixed-risk recovery reservation is an exactly-once safety token. It
+    # must never expire into a second add after a process crash in the narrow
+    # window between an exchange fill and the durable fill record.
+    if pending.get("fixed_risk_recovery"):
+        return True
+
     timeout = max(float(getattr(config, "DCA_PENDING_TIMEOUT_SECONDS", 300)), 1)
 
     try:
@@ -673,13 +716,78 @@ def reserve_dca_level(state, symbol, expected_dca_count, level_info=None):
             if _pending_dca_is_active(pending):
                 return False, f"level {pending.get('level')} already pending"
 
+            if getattr(config, "DCA_FIXED_RISK_ENABLED", False):
+                recovery_status = str(
+                    item.get("dca_recovery_status") or ""
+                ).upper()
+                recovery_level = int(
+                    item.get("dca_recovery_level", 0) or 0
+                )
+
+                if recovery_status != "ARMED" or recovery_level != level:
+                    return False, "recovery confirmation state changed"
+
+                multi_tp_stage = str(item.get("multi_tp_stage") or "").upper()
+
+                if (
+                    multi_tp_stage in ("RUNNER_PENDING", "RUNNER_ACTIVE") or
+                    (
+                        multi_tp_stage == "TP1_PENDING" and
+                        item.get("tp1_trigger_seen_at")
+                    )
+                ):
+                    return False, "TP1 runner owns position"
+
+                if any(
+                    item.get(field) in (
+                        "PENDING",
+                        "SUBMITTED",
+                        "UNCERTAIN",
+                        "FAILED",
+                    )
+                    for field in (
+                        "early_invalidation_exit_status",
+                        "time_exit_status",
+                        "reversal_profit_exit_status",
+                        "trend_profit_exit_status",
+                    )
+                ):
+                    return False, "position exit is pending"
+
+                expected_stop = float(
+                    (level_info or {}).get("hard_stop_price") or 0
+                )
+                persisted_stop = float(
+                    item.get("campaign_stop_price") or 0
+                )
+
+                if (
+                    expected_stop <= 0 or
+                    persisted_stop <= 0 or
+                    abs(expected_stop - persisted_stop) >
+                    max(abs(persisted_stop) * 1e-10, 1e-10)
+                ):
+                    return False, "campaign stop changed"
+
             item["pending_dca"] = {
                 "level": level,
                 "started_at": now_iso(),
+                "fixed_risk_recovery": bool(
+                    getattr(config, "DCA_FIXED_RISK_ENABLED", False)
+                ),
                 "trigger_roi": (level_info or {}).get("trigger_roi"),
                 "adverse_roi": (level_info or {}).get("adverse_roi"),
                 "price_source": (level_info or {}).get("price_source"),
+                "hard_stop_price": (level_info or {}).get("hard_stop_price"),
+                "campaign_risk_budget_usdt": (level_info or {}).get(
+                    "campaign_risk_budget_usdt"
+                ),
+                "recovery_risk_budget_usdt": (level_info or {}).get(
+                    "recovery_risk_budget_usdt"
+                ),
             }
+            if getattr(config, "DCA_FIXED_RISK_ENABLED", False):
+                item["dca_recovery_status"] = "RESERVED"
             item["updated_at"] = now_iso()
             latest_state.setdefault("positions", {})[symbol] = item
             _save_trade_state_unlocked(latest_state)
@@ -715,6 +823,14 @@ def clear_dca_reservation(state, symbol, level=None):
                     return False
 
                 item.pop("pending_dca", None)
+
+                if (
+                    str(item.get("dca_recovery_status") or "").upper() ==
+                    "RESERVED" and
+                    not item.get("dca_recovery_disabled")
+                ):
+                    item["dca_recovery_status"] = "ARMED"
+
                 item["updated_at"] = now_iso()
                 latest_state.setdefault("positions", {})[symbol] = item
                 _save_trade_state_unlocked(latest_state)

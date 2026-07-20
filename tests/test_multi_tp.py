@@ -209,6 +209,14 @@ class MultiTpExchangeTests(unittest.TestCase):
             side_effect=RuntimeError("partial rejected"),
         ), patch.object(
             exchange,
+            "normalize_order_quantity",
+            return_value=0.5,
+        ), patch.object(
+            exchange,
+            "find_matching_open_algo_order",
+            return_value={"query_ok": True, "order_id": None, "order": None},
+        ), patch.object(
+            exchange,
             "place_close_position_protection",
             return_value={"algoId": 321},
         ) as full_order:
@@ -229,7 +237,7 @@ class MultiTpExchangeTests(unittest.TestCase):
         self.assertIn("partial rejected", result["multi_tp_fallback_reason"])
         full_order.assert_called_once()
 
-    def test_accepted_partial_tp_is_cancelled_when_later_protection_fails(self):
+    def test_stop_failure_prevents_any_partial_tp_submission(self):
         with patch.object(config, "MULTI_TP_ENABLED", True), patch.object(
             config,
             "STATIC_TP_ENABLED",
@@ -249,7 +257,7 @@ class MultiTpExchangeTests(unittest.TestCase):
         ), patch(
             "exchange.place_partial_take_profit",
             return_value=({"algoId": 123}, 0.5),
-        ), patch(
+        ) as partial, patch(
             "exchange.place_close_position_protection",
             side_effect=RuntimeError("SL endpoint unavailable"),
         ), patch(
@@ -270,9 +278,10 @@ class MultiTpExchangeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["multi_tp_active"])
         self.assertIsNone(result["tp_order"])
-        cancel.assert_called_once_with("BTCUSDT", 123)
+        partial.assert_not_called()
+        cancel.assert_not_called()
 
-    def test_rejected_sl_response_fails_and_cleans_up_tp(self):
+    def test_rejected_sl_response_fails_before_tp_submission(self):
         with patch.object(config, "MULTI_TP_ENABLED", True), patch.object(
             config,
             "STATIC_TP_ENABLED",
@@ -292,7 +301,7 @@ class MultiTpExchangeTests(unittest.TestCase):
         ), patch(
             "exchange.place_partial_take_profit",
             return_value=({"algoId": 123}, 0.5),
-        ), patch(
+        ) as partial, patch(
             "exchange.place_close_position_protection",
             return_value={"algoStatus": "REJECTED"},
         ), patch(
@@ -312,9 +321,10 @@ class MultiTpExchangeTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertFalse(result["sl_created"])
-        cancel.assert_called_once_with("BTCUSDT", 123)
+        partial.assert_not_called()
+        cancel.assert_not_called()
 
-    def test_uncancelled_partial_tp_remains_tracked_and_blocks_retry(self):
+    def test_accepted_hard_stop_is_retained_when_tp_submission_fails(self):
         with patch.object(config, "MULTI_TP_ENABLED", True), patch.object(
             config,
             "STATIC_TP_ENABLED",
@@ -333,10 +343,19 @@ class MultiTpExchangeTests(unittest.TestCase):
             return_value=100,
         ), patch(
             "exchange.place_partial_take_profit",
-            return_value=({"algoId": 123}, 0.5),
+            side_effect=RuntimeError("partial TP unavailable"),
+        ), patch(
+            "exchange.normalize_order_quantity",
+            return_value=0.5,
+        ), patch(
+            "exchange.find_matching_open_algo_order",
+            return_value={"query_ok": True, "order_id": None, "order": None},
         ), patch(
             "exchange.place_close_position_protection",
-            side_effect=RuntimeError("SL endpoint unavailable"),
+            side_effect=[
+                {"algoId": 777, "algoStatus": "NEW"},
+                RuntimeError("full TP unavailable"),
+            ],
         ), patch(
             "exchange.cancel_algo_order",
             return_value=False,
@@ -353,10 +372,11 @@ class MultiTpExchangeTests(unittest.TestCase):
             )
 
         self.assertFalse(result["ok"])
-        self.assertTrue(result["multi_tp_active"])
-        self.assertTrue(result["protection_cleanup_failed"])
-        self.assertEqual(result["uncancelled_tp_order_id"], 123)
-        self.assertEqual(result["tp_order"]["algoId"], 123)
+        self.assertTrue(result["sl_created"])
+        self.assertEqual(result["sl_order"]["algoId"], 777)
+        self.assertFalse(result["multi_tp_active"])
+        self.assertFalse(result.get("protection_cleanup_failed", False))
+        self.assertIsNone(result["tp_order"])
 
 
 class MultiTpMonitorTests(unittest.TestCase):
@@ -526,6 +546,53 @@ class MultiTpMonitorTests(unittest.TestCase):
             RUNNER_PENDING,
         )
         configure.assert_called_once()
+
+    def test_tp1_touch_is_durably_latched_before_retry_throttle(self):
+        monitor = main.DcaWebsocketMonitor()
+        state = {
+            "positions": {
+                "BTCUSDT": {
+                    "managed_by_bot": True,
+                    "multi_tp_active": True,
+                    "multi_tp_stage": TP1_PENDING,
+                    "side": "BUY",
+                    "avg_entry": 100,
+                    "tp1_price": 105,
+                    "tp1_base_quantity": 1,
+                    "tp1_quantity": 0.75,
+                    "tp1_order_id": 77,
+                }
+            }
+        }
+
+        with patch("main.load_trade_state", return_value=state), patch(
+            "main.update_position_runtime_fields",
+            side_effect=apply_updates,
+        ) as persist, patch.object(
+            monitor,
+            "_multi_tp_retry_ready",
+            return_value=False,
+        ) as retry_ready, patch(
+            "main.get_open_position_details",
+        ) as live_details:
+            handled = monitor._handle_multi_tp_runner(
+                "BTCUSDT",
+                105,
+                state,
+            )
+
+        self.assertFalse(handled)
+        self.assertTrue(
+            state["positions"]["BTCUSDT"].get("tp1_trigger_seen_at")
+        )
+        self.assertTrue(
+            main.tp1_transition_blocks_recovery(
+                state["positions"]["BTCUSDT"]
+            )
+        )
+        persist.assert_called_once()
+        retry_ready.assert_called_once()
+        live_details.assert_not_called()
 
     def test_runner_places_stop_before_tp2_and_then_becomes_active(self):
         monitor = main.DcaWebsocketMonitor()
