@@ -1,9 +1,10 @@
 import csv
+import json
 import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, call, patch
 
 import config
 
@@ -121,6 +122,237 @@ class PositionModeVerificationTests(unittest.TestCase):
             side_effect=RuntimeError("offline"),
         ):
             self.assertFalse(exchange.is_one_way_position_mode())
+
+
+class FuturesSymbolCatalogTests(unittest.TestCase):
+    def test_known_symbol_includes_non_trading_catalog_entries(self):
+        with patch.object(
+            exchange,
+            "get_exchange_info",
+            return_value={
+                "symbols": [
+                    {
+                        "symbol": "OLDUSDT",
+                        "status": "SETTLING",
+                        "contractType": "PERPETUAL",
+                    },
+                ],
+            },
+        ):
+            self.assertTrue(exchange.is_known_futures_symbol("oldusdt"))
+
+    def test_valid_nonempty_catalog_confirms_symbol_absence(self):
+        with patch.object(
+            exchange,
+            "get_exchange_info",
+            return_value={"symbols": [{"symbol": "BTCUSDT"}]},
+        ):
+            self.assertFalse(exchange.is_known_futures_symbol("TESTUSDT"))
+
+    def test_empty_or_unavailable_catalog_is_uncertain(self):
+        with patch.object(
+            exchange,
+            "get_exchange_info",
+            return_value={"symbols": []},
+        ):
+            self.assertIsNone(exchange.is_known_futures_symbol("TESTUSDT"))
+
+        with patch.object(
+            exchange,
+            "get_exchange_info",
+            side_effect=RuntimeError("offline"),
+        ), patch.object(
+            exchange,
+            "_public_rest_log_allowed",
+            return_value=False,
+        ):
+            self.assertIsNone(exchange.is_known_futures_symbol("TESTUSDT"))
+
+    def test_shadow_depth_budget_warning_uses_one_global_throttle_key(self):
+        with patch.object(
+            exchange,
+            "get_public_rest_backoff_remaining",
+            return_value=0,
+        ), patch.object(
+            exchange,
+            "_try_reserve_shadow_public_weight",
+            return_value=False,
+        ), patch.object(
+            exchange,
+            "_public_rest_log_allowed",
+            side_effect=(True, False),
+        ) as log_allowed, patch.object(exchange, "log_warning") as warning:
+            self.assertIsNone(exchange.get_futures_depth_snapshot("BTCUSDT"))
+            self.assertIsNone(exchange.get_futures_depth_snapshot("ETHUSDT"))
+
+        self.assertEqual(
+            log_allowed.call_args_list,
+            [call("shadow_depth_budget"), call("shadow_depth_budget")],
+        )
+        warning.assert_called_once_with(
+            "Shadow depth snapshots deferred | "
+            "core public REST reserve protected"
+        )
+
+
+class PendingClientOrderAbsenceTests(unittest.TestCase):
+    @staticmethod
+    def _not_found_result():
+        return (
+            None,
+            False,
+            1,
+            ["APIError(code=-2013): Order does not exist."],
+        )
+
+    def test_deterministic_not_found_requires_both_complete_sweeps(self):
+        with patch.object(
+            exchange,
+            "_resolve_entry_order",
+            side_effect=[self._not_found_result(), self._not_found_result()],
+        ), patch.object(
+            exchange,
+            "_cancel_unsettled_entry_order",
+            return_value=(
+                None,
+                "APIError(code=-2011): Unknown order sent.",
+            ),
+        ), patch.object(
+            exchange,
+            "_private_rest_call",
+            side_effect=[[], []],
+        ) as private_call:
+            result = exchange.reconcile_execution_client_orders(
+                SYMBOL,
+                "cid-never-accepted",
+                cancel_unsettled=True,
+            )
+
+        self.assertEqual(private_call.call_count, 2)
+        self.assertTrue(result["client_order_ids_valid"])
+        self.assertTrue(result["all_definitively_absent"])
+        self.assertFalse(result["lookup_uncertain"])
+        self.assertFalse(result["order_terminal"])
+        self.assertEqual(
+            result["client_outcomes"][0]["outcome"],
+            "DEFINITIVELY_ABSENT",
+        )
+        self.assertTrue(result["absence_evidence"]["open_orders_sweep_ok"])
+        self.assertTrue(
+            result["absence_evidence"]["order_history_sweep_ok"]
+        )
+        json.dumps(result)
+
+    def test_history_match_resolves_through_normal_terminal_path(self):
+        history_order = execution_order(
+            "CANCELED",
+            0,
+            order_id="history-1",
+            client_order_id="cid-history",
+        )
+
+        with patch.object(
+            exchange,
+            "_resolve_entry_order",
+            side_effect=[self._not_found_result(), self._not_found_result()],
+        ), patch.object(
+            exchange,
+            "_cancel_unsettled_entry_order",
+            return_value=(
+                None,
+                "APIError(code=-2013): Order does not exist.",
+            ),
+        ), patch.object(
+            exchange,
+            "_private_rest_call",
+            side_effect=[[], [history_order]],
+        ):
+            result = exchange.reconcile_execution_client_orders(
+                SYMBOL,
+                "cid-history",
+                cancel_unsettled=True,
+            )
+
+        self.assertTrue(result["order_terminal"])
+        self.assertTrue(result["any_order_seen"])
+        self.assertFalse(result["all_definitively_absent"])
+        self.assertEqual(result["orders"], [history_order])
+        self.assertEqual(
+            result["client_outcomes"][0]["outcome"],
+            "FOUND_TERMINAL",
+        )
+        self.assertTrue(result["client_outcomes"][0]["history_match"])
+
+    def test_transient_lookup_failure_never_runs_absence_sweeps(self):
+        transient = (None, False, 1, ["read timeout"])
+
+        with patch.object(
+            exchange,
+            "_resolve_entry_order",
+            side_effect=[transient, transient],
+        ), patch.object(
+            exchange,
+            "_cancel_unsettled_entry_order",
+            return_value=(None, "cancel timeout"),
+        ), patch.object(
+            exchange,
+            "_private_rest_call",
+        ) as private_call:
+            result = exchange.reconcile_execution_client_orders(
+                SYMBOL,
+                "cid-uncertain",
+                cancel_unsettled=True,
+            )
+
+        private_call.assert_not_called()
+        self.assertTrue(result["lookup_uncertain"])
+        self.assertFalse(result["all_definitively_absent"])
+        self.assertEqual(
+            result["client_outcomes"][0]["outcome"],
+            "UNKNOWN",
+        )
+
+    def test_terminal_order_plus_absent_fallback_remains_nonterminal(self):
+        terminal_order = execution_order(
+            "EXPIRED",
+            0,
+            order_id="ioc-terminal",
+            client_order_id="cid-ioc-terminal",
+        )
+
+        with patch.object(
+            exchange,
+            "_resolve_entry_order",
+            side_effect=[
+                (terminal_order, True, 1, []),
+                self._not_found_result(),
+                self._not_found_result(),
+            ],
+        ), patch.object(
+            exchange,
+            "_cancel_unsettled_entry_order",
+            return_value=(
+                None,
+                "APIError(code=-2011): Unknown order sent.",
+            ),
+        ), patch.object(
+            exchange,
+            "_private_rest_call",
+            side_effect=[[], []],
+        ):
+            result = exchange.reconcile_execution_client_orders(
+                SYMBOL,
+                "cid-ioc-terminal,cid-never-submitted",
+                cancel_unsettled=True,
+            )
+
+        self.assertTrue(result["all_client_outcomes_resolved"])
+        self.assertFalse(result["order_terminal"])
+        self.assertFalse(result["all_definitively_absent"])
+        self.assertEqual(
+            [item["outcome"] for item in result["client_outcomes"]],
+            ["FOUND_TERMINAL", "DEFINITIVELY_ABSENT"],
+        )
 
 
 class OfflineExecutionCase(unittest.TestCase):

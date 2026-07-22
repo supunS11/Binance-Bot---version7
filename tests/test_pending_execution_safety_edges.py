@@ -76,8 +76,14 @@ def dca_state(pending):
 class PendingDcaTerminalSafetyTests(unittest.TestCase):
     def setUp(self):
         main.entry_quarantined_symbols.discard(SYMBOL)
+        self.known_symbol_patch = patch(
+            "main.is_known_futures_symbol",
+            return_value=True,
+        )
+        self.known_symbol_patch.start()
 
     def tearDown(self):
+        self.known_symbol_patch.stop()
         main.entry_quarantined_symbols.discard(SYMBOL)
 
     def test_terminal_zero_fill_reverifies_stop_without_cancelling_protection(self):

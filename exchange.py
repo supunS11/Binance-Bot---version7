@@ -774,6 +774,47 @@ def get_supported_symbols():
         return set()
 
 
+def is_known_futures_symbol(symbol):
+    """Return whether Binance's authoritative futures catalog knows a symbol.
+
+    ``None`` means the catalog could not be validated.  This deliberately
+    includes every catalog entry, regardless of trading status or contract
+    type, so callers do not mistake a known but suspended/delisted contract
+    for a fabricated runtime-state symbol.
+    """
+    try:
+        exchange_info = get_exchange_info()
+
+        if not isinstance(exchange_info, dict):
+            return None
+
+        catalog = exchange_info.get("symbols")
+
+        if not isinstance(catalog, list) or not catalog:
+            return None
+
+        known_symbols = {
+            str(item.get("symbol") or "").strip().upper()
+            for item in catalog
+            if isinstance(item, dict) and item.get("symbol")
+        }
+
+        if not known_symbols:
+            return None
+
+        normalized_symbol = str(symbol or "").strip().upper()
+
+        if not normalized_symbol:
+            return False
+
+        return normalized_symbol in known_symbols
+
+    except Exception as exc:
+        if _public_rest_log_allowed("futures_symbol_catalog_validation"):
+            log_warning(f"Futures symbol catalog validation unavailable: {exc}")
+        return None
+
+
 def _to_float(value, default=None):
     try:
         if value in (None, ""):
@@ -1106,9 +1147,9 @@ def get_futures_depth_snapshot(symbol, limit=None):
         return None
 
     if not _try_reserve_shadow_public_weight(weight):
-        if _public_rest_log_allowed(f"shadow_depth_budget:{symbol}"):
+        if _public_rest_log_allowed("shadow_depth_budget"):
             log_warning(
-                f"{symbol} shadow depth snapshot deferred | "
+                "Shadow depth snapshots deferred | "
                 "core public REST reserve protected"
             )
         return None
@@ -2575,6 +2616,59 @@ def _cancel_unsettled_entry_order(symbol, client_order_id):
         return None, str(exc)
 
 
+def _execution_error_code(error):
+    if error in (None, ""):
+        return None
+
+    code = getattr(error, "code", None)
+
+    if code is not None:
+        try:
+            return int(code)
+        except (TypeError, ValueError):
+            pass
+
+    match = re.search(r"(?:code\s*=\s*|\"code\"\s*:\s*)(-?\d+)", str(error))
+
+    if not match:
+        return None
+
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _execution_client_order_id_is_valid(client_order_id):
+    return bool(
+        re.fullmatch(
+            r"[.A-Za-z0-9_:/-]{1,36}",
+            str(client_order_id or ""),
+        )
+    )
+
+
+def _latest_client_order_match(orders, client_order_id):
+    matches = [
+        order
+        for order in (orders or [])
+        if isinstance(order, dict) and
+        str(order.get("clientOrderId") or "") == str(client_order_id)
+    ]
+
+    if not matches:
+        return None
+
+    return max(
+        matches,
+        key=lambda order: (
+            int(_to_float(order.get("updateTime"), 0) or 0),
+            int(_to_float(order.get("time"), 0) or 0),
+            int(_to_float(order.get("orderId"), 0) or 0),
+        ),
+    )
+
+
 def reconcile_execution_client_orders(
     symbol,
     client_order_ids,
@@ -2594,18 +2688,25 @@ def reconcile_execution_client_orders(
             if str(item).strip()
         ]
 
+    client_order_ids = list(dict.fromkeys(client_order_ids))
+    client_order_ids_valid = bool(client_order_ids) and all(
+        _execution_client_order_id_is_valid(client_order_id)
+        for client_order_id in client_order_ids
+    )
     orders = []
     errors = []
-    all_terminal = bool(client_order_ids)
     verification_attempts = 0
+    client_outcomes = []
 
     for client_order_id in client_order_ids:
-        order, terminal, attempts, status_errors = _resolve_entry_order(
+        order, terminal, attempts, initial_status_errors = _resolve_entry_order(
             symbol,
             client_order_id,
         )
         verification_attempts += attempts
-        errors.extend(status_errors)
+        errors.extend(initial_status_errors)
+        cancel_error = ""
+        post_cancel_status_errors = []
 
         if not terminal and cancel_unsettled:
             cancel_order, cancel_error = _cancel_unsettled_entry_order(
@@ -2623,14 +2724,181 @@ def reconcile_execution_client_orders(
             )
             verification_attempts += attempts
             errors.extend(status_errors)
+            post_cancel_status_errors = status_errors
 
-        if order:
+        query_errors = list(initial_status_errors) + list(
+            post_cancel_status_errors
+        )
+        query_error_codes = [
+            _execution_error_code(error)
+            for error in query_errors
+        ]
+        deterministic_query_absence = bool(
+            not order and
+            initial_status_errors and
+            post_cancel_status_errors and
+            query_error_codes and
+            all(code == -2013 for code in query_error_codes)
+        )
+        cancel_error_code = _execution_error_code(cancel_error)
+        provisional_absence = bool(
+            deterministic_query_absence and
+            cancel_error_code in (-2011, -2013)
+        )
+        outcome = (
+            "FOUND_TERMINAL"
+            if order and terminal
+            else "FOUND_OPEN"
+            if order
+            else "PROVISIONAL_ABSENCE"
+            if provisional_absence
+            else "UNKNOWN"
+        )
+        client_outcomes.append({
+            "client_order_id": client_order_id,
+            "outcome": outcome,
+            "terminal": bool(terminal),
+            "order_seen": bool(order),
+            "executed_quantity": _execution_quantity(
+                (order or {}).get("executedQty")
+            ),
+            "query_error_codes": query_error_codes,
+            "cancel_error_code": cancel_error_code,
+            "open_orders_sweep_ok": None,
+            "order_history_sweep_ok": None,
+            "history_match": False,
+            "order": order if isinstance(order, dict) else None,
+        })
+
+    provisional_outcomes = [
+        item
+        for item in client_outcomes
+        if item.get("outcome") == "PROVISIONAL_ABSENCE"
+    ]
+    open_orders = None
+    order_history = None
+    open_orders_sweep_error = ""
+    order_history_sweep_error = ""
+
+    if provisional_outcomes:
+        try:
+            open_orders = _private_rest_call(
+                f"futures_get_open_orders:{symbol}",
+                client.futures_get_open_orders,
+                symbol=symbol,
+            )
+
+            if not isinstance(open_orders, list):
+                raise TypeError("open-order sweep returned a non-list value")
+        except Exception as exc:
+            open_orders_sweep_error = str(exc)
+            errors.append(open_orders_sweep_error)
+
+        history_limit = min(
+            max(
+                int(
+                    getattr(
+                        config,
+                        "PENDING_EXECUTION_ORDER_HISTORY_LIMIT",
+                        1000,
+                    )
+                ),
+                1,
+            ),
+            1000,
+        )
+
+        try:
+            order_history = _private_rest_call(
+                f"futures_get_all_orders:{symbol}",
+                client.futures_get_all_orders,
+                symbol=symbol,
+                limit=history_limit,
+            )
+
+            if not isinstance(order_history, list):
+                raise TypeError("order-history sweep returned a non-list value")
+        except Exception as exc:
+            order_history_sweep_error = str(exc)
+            errors.append(order_history_sweep_error)
+
+        sweeps_ok = bool(
+            isinstance(open_orders, list) and
+            isinstance(order_history, list)
+        )
+
+        for item in provisional_outcomes:
+            client_order_id = item["client_order_id"]
+            item["open_orders_sweep_ok"] = isinstance(open_orders, list)
+            item["order_history_sweep_ok"] = isinstance(order_history, list)
+            open_match = _latest_client_order_match(
+                open_orders,
+                client_order_id,
+            )
+            history_match = _latest_client_order_match(
+                order_history,
+                client_order_id,
+            )
+            resolved_order = open_match or history_match
+
+            if resolved_order:
+                item["order"] = resolved_order
+                item["order_seen"] = True
+                item["history_match"] = bool(history_match)
+                item["terminal"] = _execution_order_is_terminal(
+                    resolved_order
+                )
+                item["executed_quantity"] = _execution_quantity(
+                    resolved_order.get("executedQty")
+                )
+                item["outcome"] = (
+                    "FOUND_TERMINAL"
+                    if item["terminal"]
+                    else "FOUND_OPEN"
+                )
+            elif sweeps_ok:
+                item["outcome"] = "DEFINITIVELY_ABSENT"
+            else:
+                item["outcome"] = "UNKNOWN"
+
+    for item in client_outcomes:
+        order = item.get("order")
+
+        if isinstance(order, dict):
             orders.append(order)
 
-        if not terminal:
-            all_terminal = False
+        item.pop("order", None)
 
     aggregate = aggregate_order_execution(orders)
+    all_client_outcomes_resolved = bool(client_outcomes) and all(
+        item.get("outcome") in (
+            "FOUND_TERMINAL",
+            "DEFINITIVELY_ABSENT",
+        )
+        for item in client_outcomes
+    )
+    all_terminal = bool(client_outcomes) and all(
+        item.get("outcome") == "FOUND_TERMINAL"
+        for item in client_outcomes
+    )
+    all_definitively_absent = bool(client_outcomes) and all(
+        item.get("outcome") == "DEFINITIVELY_ABSENT"
+        for item in client_outcomes
+    )
+    any_order_seen = any(
+        bool(item.get("order_seen"))
+        for item in client_outcomes
+    )
+    max_executed_quantity_seen = max(
+        [
+            _execution_quantity(item.get("executed_quantity"))
+            for item in client_outcomes
+        ] or [0.0]
+    )
+    lookup_uncertain = bool(
+        not client_outcomes or
+        any(item.get("outcome") == "UNKNOWN" for item in client_outcomes)
+    )
     return {
         "order_terminal": all_terminal,
         "orders": orders,
@@ -2640,6 +2908,33 @@ def reconcile_execution_client_orders(
         "client_order_ids": ",".join(client_order_ids),
         "verification_attempts": verification_attempts,
         "error": " | ".join(errors),
+        "client_outcomes": client_outcomes,
+        "client_order_ids_valid": client_order_ids_valid,
+        "all_client_outcomes_resolved": all_client_outcomes_resolved,
+        "all_definitively_absent": all_definitively_absent,
+        "any_order_seen": any_order_seen,
+        "max_executed_quantity_seen": max_executed_quantity_seen,
+        "lookup_uncertain": lookup_uncertain,
+        "absence_evidence": {
+            "provisional_count": len(provisional_outcomes),
+            "definitive_count": sum(
+                1
+                for item in client_outcomes
+                if item.get("outcome") == "DEFINITIVELY_ABSENT"
+            ),
+            "open_orders_sweep_ok": (
+                isinstance(open_orders, list)
+                if provisional_outcomes
+                else None
+            ),
+            "order_history_sweep_ok": (
+                isinstance(order_history, list)
+                if provisional_outcomes
+                else None
+            ),
+            "open_orders_sweep_error": open_orders_sweep_error,
+            "order_history_sweep_error": order_history_sweep_error,
+        },
     }
 
 

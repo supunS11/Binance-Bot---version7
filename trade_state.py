@@ -325,6 +325,147 @@ def remove_pending_execution(state, symbol):
     return False
 
 
+def _normalized_execution_client_ids(value):
+    if isinstance(value, str):
+        values = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = []
+
+    normalized = []
+
+    for item in values:
+        client_order_id = str(item or "").strip()
+
+        if client_order_id and client_order_id not in normalized:
+            normalized.append(client_order_id)
+
+    return tuple(normalized)
+
+
+def clear_confirmed_absent_entry_execution(
+    state,
+    symbol,
+    expected_client_order_ids,
+):
+    """Atomically clear a proven-never-accepted ENTRY and its intent marker.
+
+    The expected client IDs are a compare-and-delete token.  A concurrent
+    pending-execution replacement, a non-ENTRY record, or any position marker
+    that could represent live/managed exposure makes this operation fail
+    closed without changing either collection.
+    """
+    expected_ids = _normalized_execution_client_ids(expected_client_order_ids)
+
+    if not expected_ids:
+        return False, "EXPECTED_CLIENT_ORDER_IDS_MISSING"
+
+    attempts, retry_delay = _state_write_retry_settings()
+
+    for attempt in range(1, attempts + 1):
+        try:
+            with _state_file_lock():
+                latest_state = _load_trade_state_unlocked()
+                pending_executions = latest_state.setdefault(
+                    "pending_executions",
+                    {},
+                )
+                positions = latest_state.setdefault("positions", {})
+                pending = pending_executions.get(symbol)
+                state["pending_executions"] = pending_executions
+                state["positions"] = positions
+
+                if not isinstance(pending, dict):
+                    return False, "PENDING_EXECUTION_MISSING"
+
+                current_ids = _normalized_execution_client_ids(
+                    pending.get("client_order_ids")
+                )
+
+                if current_ids != expected_ids:
+                    return False, "PENDING_CLIENT_ORDER_IDS_CHANGED"
+
+                if (
+                    str(pending.get("symbol") or "").strip().upper() !=
+                    str(symbol or "").strip().upper()
+                ):
+                    return False, "PENDING_SYMBOL_CHANGED"
+
+                if str(pending.get("context") or "").upper() != "ENTRY":
+                    return False, "PENDING_CONTEXT_NOT_ENTRY"
+
+                try:
+                    pre_position_amount = abs(
+                        float(pending.get("pre_position_amount", 0) or 0)
+                    )
+                except (TypeError, ValueError):
+                    return False, "PENDING_PRE_POSITION_INVALID"
+
+                if pre_position_amount > 1e-12:
+                    return False, "PENDING_PRE_POSITION_NOT_FLAT"
+
+                marker = positions.get(symbol)
+
+                if marker is not None:
+                    if not isinstance(marker, dict):
+                        return False, "POSITION_MARKER_INVALID"
+
+                    submission = marker.get("pending_submission")
+
+                    try:
+                        initial_quantity = abs(
+                            float(marker.get("initial_quantity", 0) or 0)
+                        )
+                    except (TypeError, ValueError):
+                        return False, "POSITION_MARKER_QUANTITY_INVALID"
+
+                    safe_marker = bool(
+                        marker.get("managed_by_bot") is True and
+                        str(
+                            marker.get("position_management_status") or ""
+                        ).upper() == "ENTRY_READY_TO_SUBMIT" and
+                        initial_quantity <= 1e-12 and
+                        isinstance(submission, dict) and
+                        str(submission.get("context") or "").upper() ==
+                        "ENTRY" and
+                        str(
+                            submission.get("submission_phase") or ""
+                        ).upper() == "READY_TO_SUBMIT"
+                    )
+
+                    if not safe_marker:
+                        return False, "POSITION_MARKER_NOT_SAFE_TO_CLEAR"
+
+                    marker_ids = _normalized_execution_client_ids(
+                        submission.get("client_order_ids")
+                    )
+
+                    if marker_ids and marker_ids != expected_ids:
+                        return False, "POSITION_MARKER_CLIENT_IDS_CHANGED"
+
+                pending_executions.pop(symbol, None)
+
+                if marker is not None:
+                    positions.pop(symbol, None)
+
+                _save_trade_state_unlocked(latest_state)
+                state["pending_executions"] = pending_executions
+                state["positions"] = positions
+            return True, "CLEARED"
+
+        except Exception as e:
+            log_error(
+                f"{symbol} confirmed-absent ENTRY clear error | "
+                f"ATTEMPT={attempt}/{attempts}: {e}"
+            )
+
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    return False, "STATE_WRITE_FAILED"
+
+
 def upsert_position_state(state, symbol, data):
     attempts = max(
         int(getattr(config, "STATE_UPSERT_RETRY_ATTEMPTS", 3)),
