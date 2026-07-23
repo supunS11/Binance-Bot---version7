@@ -4238,7 +4238,8 @@ def evaluate_trend_profit_protection(
 def _refresh_side_decision(side_data):
     trend_ok = bool(side_data.get("trend_following_ok"))
     reversal_ok = bool(side_data.get("reversal_ok"))
-    side_data["hard_ok"] = trend_ok or reversal_ok
+    range_reversion_ok = bool((side_data.get("range_reversion") or {}).get("active"))
+    side_data["hard_ok"] = trend_ok or reversal_ok or range_reversion_ok
 
     if trend_ok:
         side_data["confirmation_type"] = "TREND"
@@ -4254,6 +4255,13 @@ def _refresh_side_decision(side_data):
             "reversal_uncapped_score_index",
             side_data.get("confidence", 0),
         )
+    elif range_reversion_ok:
+        side_data["confirmation_type"] = "RANGE_REVERSION"
+        side_data["confidence"] = (side_data.get("range_reversion") or {}).get(
+            "confidence",
+            0,
+        )
+        side_data["uncapped_score_index"] = side_data["confidence"]
     else:
         side_data["confirmation_type"] = "NONE"
         side_data["confidence"] = side_data.get("trend_confidence", 0)
@@ -4450,6 +4458,108 @@ def _apply_trend_exhaustion_guard(buy, sell):
     return buy, sell
 
 
+def _range_reversion_context(
+    side,
+    entry_df,
+    regime_context,
+    confirm_score,
+    quality_score,
+    level_ok,
+    level,
+):
+    """Mean-reversion fade at a validated range boundary.
+
+    Deliberately scored from its own inputs (level quality + RSI extremity)
+    rather than the trend/confirm/entry aggregate score: a sideways regime
+    implies that aggregate is not diagnostic for a fade trade, and reusing
+    it would conflate two different strategies' confidence numbers.
+    """
+    enabled = bool(getattr(config, "RANGE_REVERSION_ENABLED", False))
+    context = {
+        "enabled": enabled,
+        "active": False,
+        "reasons": [],
+        "score": 0,
+        "confidence": 0,
+    }
+
+    if not enabled:
+        context["reasons"].append("RANGE_REVERSION_DISABLED")
+        return context
+
+    regime = regime_context.get("regime")
+
+    if regime != "sideways":
+        context["reasons"].append(f"REGIME_NOT_SIDEWAYS={regime}")
+        return context
+
+    if not level_ok or not level or "level" not in level:
+        context["reasons"].append("NO_RANGE_BOUNDARY_LEVEL")
+        return context
+
+    max_level_roi = get_config_float("RANGE_REVERSION_MAX_LEVEL_ADVERSE_ROI", 8.0)
+    level_adverse_roi = abs(_safe_float(level.get("adverse_roi"), 999))
+
+    if level_adverse_roi > max_level_roi:
+        context["reasons"].append(
+            f"LEVEL_TOO_FAR ROI={round(level_adverse_roi, 2)} > {max_level_roi}"
+        )
+        return context
+
+    min_level_score = get_config_float("RANGE_REVERSION_MIN_LEVEL_SCORE", 3.0)
+    level_score = _safe_float(level.get("score"))
+
+    if level_score < min_level_score:
+        context["reasons"].append(
+            f"LEVEL_SCORE_LOW {level_score} < {min_level_score}"
+        )
+        return context
+
+    entry = latest_closed(entry_df)
+    rsi = _safe_float(entry.get("rsi"), 50)
+    oversold = get_config_float("RANGE_REVERSION_RSI_OVERSOLD", 32)
+    overbought = get_config_float("RANGE_REVERSION_RSI_OVERBOUGHT", 68)
+    rsi_extreme = rsi <= oversold if side == "BUY" else rsi >= overbought
+
+    if not rsi_extreme:
+        context["reasons"].append(f"RSI_NOT_EXTREME={round(rsi, 1)}")
+        return context
+
+    min_quality = get_config_float("RANGE_REVERSION_MIN_QUALITY_SCORE", 0.0)
+
+    if quality_score < min_quality:
+        context["reasons"].append(
+            f"QUALITY_SCORE_LOW {quality_score} < {min_quality}"
+        )
+        return context
+
+    min_confirm = get_config_float("RANGE_REVERSION_MIN_CONFIRM_SCORE", -3.0)
+
+    if confirm_score < min_confirm:
+        context["reasons"].append(
+            f"CONFIRM_SCORE_TOO_WEAK {confirm_score} < {min_confirm}"
+        )
+        return context
+
+    rsi_edge = (oversold - rsi) if side == "BUY" else (rsi - overbought)
+    proximity_component = (
+        (max_level_roi - level_adverse_roi) / max(max_level_roi, 0.01)
+    ) * 2
+    score = max(level_score + proximity_component + max(rsi_edge, 0) / 10, 0)
+    max_score = get_config_float("RANGE_REVERSION_CONFIDENCE_MAX_SCORE", 12.0)
+    confidence = score_to_confidence(score, max_score)
+
+    context.update({
+        "active": True,
+        "score": round(score, 2),
+        "confidence": confidence,
+        "rsi": round(rsi, 2),
+        "level_adverse_roi": round(level_adverse_roi, 2),
+        "level_score": level_score,
+    })
+    return context
+
+
 def _side_signal_score(
     side,
     trend_df,
@@ -4512,6 +4622,15 @@ def _side_signal_score(
     )
     level_check_disabled = bool(level.get("level_check_disabled")) if level else False
     level_score = 4 if level_ok and not level_check_disabled else 0
+    range_reversion = _range_reversion_context(
+        side,
+        entry_df,
+        regime_context,
+        confirm_score,
+        quality_score,
+        level_ok,
+        level,
+    )
 
     total = (
         trend_score +
@@ -4671,6 +4790,7 @@ def _side_signal_score(
         "reversal_confirmed": reversal_confirmed,
         "reversal_reasons": reversal_reasons,
         "reversal_context": reversal_context,
+        "range_reversion": range_reversion,
         "trend_ok": trend_ok,
         "confirm_ok": confirm_ok,
         "entry_ok": entry_ok,
@@ -4684,6 +4804,9 @@ def _side_signal_score(
 
 
 def _signal_threshold(side_data):
+    if side_data.get("confirmation_type") == "RANGE_REVERSION":
+        return get_config_float("RANGE_REVERSION_SIGNAL_THRESHOLD", 70)
+
     if side_data.get("confirmation_type") != "REVERSAL":
         return config.LONG_TERM_SIGNAL_THRESHOLD
 
@@ -4704,6 +4827,9 @@ def _signal_threshold(side_data):
 def _signal_edge(side_data):
     if side_data.get("confirmation_type") == "REVERSAL":
         return get_config_float("REVERSAL_MIN_SIGNAL_EDGE", 0)
+
+    if side_data.get("confirmation_type") == "RANGE_REVERSION":
+        return get_config_float("RANGE_REVERSION_MIN_SIGNAL_EDGE", 0)
 
     return config.LONG_TERM_MIN_SIGNAL_EDGE
 

@@ -502,6 +502,11 @@ def stop_loss_enabled(confirmation_type):
     if confirmation_type == "REVERSAL":
         return bool(getattr(config, "REVERSAL_SL_ENABLED", config.SL_ENABLED))
 
+    if confirmation_type == "RANGE_REVERSION":
+        return bool(
+            getattr(config, "RANGE_REVERSION_SL_ENABLED", config.SL_ENABLED)
+        )
+
     if confirmation_type == "TREND":
         return bool(getattr(config, "TREND_SL_ENABLED", config.SL_ENABLED))
 
@@ -513,6 +518,11 @@ def max_sl_roi(confirmation_type):
 
     if confirmation_type == "REVERSAL":
         return float(getattr(config, "REVERSAL_MAX_SL_ROI", config.MAX_SL_ROI))
+
+    if confirmation_type == "RANGE_REVERSION":
+        return float(
+            getattr(config, "RANGE_REVERSION_MAX_SL_ROI", config.MAX_SL_ROI)
+        )
 
     return float(getattr(config, "TREND_MAX_SL_ROI", config.MAX_SL_ROI))
 
@@ -1099,13 +1109,35 @@ def simulate_trade(
                     break
 
         if not tp1_hit and getattr(config, "TIME_EXIT_ENABLED", False):
-            route = (
-                "REVERSAL"
-                if str(confirmation_type or "").upper() == "REVERSAL"
-                else "TREND"
-            )
+            confirmation_type_upper = str(confirmation_type or "").upper()
+
+            if confirmation_type_upper == "REVERSAL":
+                route = "REVERSAL"
+            elif confirmation_type_upper == "RANGE_REVERSION":
+                route = "RANGE_REVERSION"
+            else:
+                route = "TREND"
+
             route_enabled = bool(
                 getattr(config, f"TIME_EXIT_{route}_ENABLED", route == "TREND")
+            )
+            time_exit_minutes_setting = (
+                getattr(
+                    config,
+                    "TIME_EXIT_RANGE_REVERSION_MINUTES",
+                    config.TIME_EXIT_MINUTES,
+                )
+                if route == "RANGE_REVERSION"
+                else config.TIME_EXIT_MINUTES
+            )
+            time_exit_max_roi_setting = (
+                getattr(
+                    config,
+                    "TIME_EXIT_RANGE_REVERSION_MAX_ROI",
+                    getattr(config, "TIME_EXIT_MAX_ROI", 0),
+                )
+                if route == "RANGE_REVERSION"
+                else getattr(config, "TIME_EXIT_MAX_ROI", 0)
             )
             elapsed_minutes = (candle_time - int(entry_time)) / 60_000
             post_dca_grace_minutes = max(
@@ -1129,9 +1161,9 @@ def simulate_trade(
 
             if (
                 route_enabled and
-                elapsed_minutes >= max(float(config.TIME_EXIT_MINUTES), 0) and
+                elapsed_minutes >= max(float(time_exit_minutes_setting), 0) and
                 post_dca_grace_complete and
-                current_roi <= min(float(config.TIME_EXIT_MAX_ROI), 0)
+                current_roi <= min(float(time_exit_max_roi_setting), 0)
             ):
                 trend_slice = closed_slice(
                     frames["trend"].indicators,
@@ -1723,6 +1755,8 @@ def passes_pre_entry_filters(signal, current_price, trend_df, confirm_df, side_a
 
     if side_analysis.get("confirmation_type") == "REVERSAL":
         min_room_override = config.REVERSAL_MIN_TP_ROOM_ROI
+    elif side_analysis.get("confirmation_type") == "RANGE_REVERSION":
+        min_room_override = config.RANGE_REVERSION_MIN_TP_ROOM_ROI
 
     room_ok, room_info = validate_entry_profit_room(
         signal,

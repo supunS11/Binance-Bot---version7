@@ -54,6 +54,7 @@ from indicators import apply_indicators
 from strategy import (
     analyze_signal,
     analyze_signal_cached,
+    detect_market_structure,
     evaluate_route_early_invalidation,
     evaluate_route_profit_protection,
     evaluate_time_exit_weakness,
@@ -68,6 +69,7 @@ from strategy import (
     validate_dca_continuation_guard,
     validate_dca_recovery_confirmation,
 )
+from volume_profile import record_volume_profile_telemetry
 from risk_management import calculate_position_size, get_position_risk_budget
 from signal_journal import append_signal_journal
 from signal_calibration import calibration_probability
@@ -739,6 +741,27 @@ def validate_position_management_config():
         ):
             errors.append(
                 "trend stop cap must cover maximum adverse ROI plus buffer"
+            )
+
+        reversal_stop_cap = float(getattr(config, "REVERSAL_MAX_SL_ROI", 0))
+
+        if (
+            getattr(config, "REVERSAL_ENTRY_ENABLED", False) and
+            reversal_stop_cap > 0 and
+            trigger_roi + stop_buffer >= reversal_stop_cap
+        ):
+            errors.append(
+                "reversal stop cap must be beyond recovery trigger plus buffer"
+            )
+
+        if (
+            getattr(config, "REVERSAL_ENTRY_ENABLED", False) and
+            reversal_stop_cap > 0 and
+            max_adverse_roi > 0 and
+            max_adverse_roi + stop_buffer > reversal_stop_cap
+        ):
+            errors.append(
+                "reversal stop cap must cover maximum adverse ROI plus buffer"
             )
 
     if getattr(config, "TIME_EXIT_ENABLED", False):
@@ -7483,15 +7506,19 @@ class DcaWebsocketMonitor:
         ):
             return None
 
-        route = (
-            "REVERSAL"
-            if str(
-                position_state.get("confirmation_type") or
-                position_state.get("signal_type") or
-                ""
-            ).upper() == "REVERSAL"
-            else "TREND"
-        )
+        confirmation_type = str(
+            position_state.get("confirmation_type") or
+            position_state.get("signal_type") or
+            ""
+        ).upper()
+
+        if confirmation_type == "REVERSAL":
+            route = "REVERSAL"
+        elif confirmation_type == "RANGE_REVERSION":
+            route = "RANGE_REVERSION"
+        else:
+            route = "TREND"
+
         route_enabled = bool(
             getattr(
                 config,
@@ -7510,7 +7537,16 @@ class DcaWebsocketMonitor:
             return None
 
         opened_elapsed = seconds_since(position_state.get("opened_at"))
-        minimum_seconds = max(float(config.TIME_EXIT_MINUTES), 0) * 60
+        time_exit_minutes = (
+            getattr(
+                config,
+                "TIME_EXIT_RANGE_REVERSION_MINUTES",
+                config.TIME_EXIT_MINUTES,
+            )
+            if route == "RANGE_REVERSION"
+            else config.TIME_EXIT_MINUTES
+        )
+        minimum_seconds = max(float(time_exit_minutes), 0) * 60
 
         if opened_elapsed is None or opened_elapsed < minimum_seconds:
             return None
@@ -7530,7 +7566,16 @@ class DcaWebsocketMonitor:
             return None
 
         current_roi = -get_position_adverse_roi(side, avg_entry, mark_price)
-        max_roi = min(float(getattr(config, "TIME_EXIT_MAX_ROI", 0)), 0)
+        max_roi_setting = (
+            getattr(
+                config,
+                "TIME_EXIT_RANGE_REVERSION_MAX_ROI",
+                getattr(config, "TIME_EXIT_MAX_ROI", 0),
+            )
+            if route == "RANGE_REVERSION"
+            else getattr(config, "TIME_EXIT_MAX_ROI", 0)
+        )
+        max_roi = min(float(max_roi_setting), 0)
 
         if current_roi > max_roi:
             return None
@@ -7554,15 +7599,19 @@ class DcaWebsocketMonitor:
         if side not in ("BUY", "SELL") or avg_entry <= 0 or mark_price <= 0:
             return None
 
-        route = (
-            "REVERSAL"
-            if str(
-                position_state.get("confirmation_type") or
-                position_state.get("signal_type") or
-                ""
-            ).upper() == "REVERSAL"
-            else "TREND"
-        )
+        committed_confirmation_type = str(
+            position_state.get("confirmation_type") or
+            position_state.get("signal_type") or
+            ""
+        ).upper()
+
+        if committed_confirmation_type == "REVERSAL":
+            route = "REVERSAL"
+        elif committed_confirmation_type == "RANGE_REVERSION":
+            route = "RANGE_REVERSION"
+        else:
+            route = "TREND"
+
         opened_elapsed = seconds_since(position_state.get("opened_at"))
         return {
             "route": route,
@@ -8485,6 +8534,7 @@ def calculate_signal_rank(candidate):
     breadth = market_context.get("breadth") or {}
     transition = market_context.get("transition") or {}
     calibration = market_context.get("calibration") or {}
+    order_flow = market_context.get("order_flow") or {}
     side_key = (signal or "").lower()
     rank += _safe_float(flow.get(f"{side_key}_score")) * _safe_float(
         getattr(config, "MARKET_FLOW_RANK_WEIGHT", 1),
@@ -8499,6 +8549,14 @@ def calculate_signal_rank(candidate):
         1,
     )
 
+    if getattr(config, "SIGNAL_RANKING_ORDERFLOW_ENABLED", False):
+        rank += _safe_float(
+            order_flow.get(f"{side_key}_shadow_score")
+        ) * _safe_float(
+            getattr(config, "SIGNAL_RANKING_ORDERFLOW_WEIGHT", 1.0),
+            1.0,
+        )
+
     if calibration.get("available"):
         probability = _safe_float(calibration.get("probability"), 0.5)
         rank += (probability - 0.5) * _safe_float(
@@ -8509,7 +8567,12 @@ def calculate_signal_rank(candidate):
     return round(rank, 2)
 
 
-def enrich_candidate_market_context(candidate, flow_monitor, breadth_context):
+def enrich_candidate_market_context(
+    candidate,
+    flow_monitor,
+    breadth_context,
+    shadow_monitor=None,
+):
     signal = str(candidate.get("signal") or "").upper()
     analysis = candidate.get("analysis") or {}
     side_data = analysis.get(signal.lower(), {}) or {}
@@ -8528,6 +8591,15 @@ def enrich_candidate_market_context(candidate, flow_monitor, breadth_context):
         if getattr(config, "REGIME_TRANSITION_ENABLED", True)
         else {"available": False, "buy_score": 0, "sell_score": 0}
     )
+    order_flow = (
+        shadow_monitor.snapshot(candidate.get("symbol"), emit_telemetry=False)
+        if shadow_monitor and getattr(
+            config,
+            "SIGNAL_RANKING_ORDERFLOW_ENABLED",
+            False,
+        )
+        else {"available": False, "buy_shadow_score": 0, "sell_shadow_score": 0}
+    )
     route = get_candidate_signal_type(candidate)
 
     if (side_data.get("continuation_pullback") or {}).get("active"):
@@ -8541,6 +8613,7 @@ def enrich_candidate_market_context(candidate, flow_monitor, breadth_context):
         "breadth": breadth,
         "transition": transition,
         "calibration": calibration,
+        "order_flow": order_flow,
         "route": route,
     }
     candidate["rank_score"] = calculate_signal_rank(candidate)
@@ -8634,13 +8707,17 @@ def get_position_signal_type(trade_state, symbol):
         ""
     ).upper()
 
-    return "REVERSAL" if signal_type == "REVERSAL" else "TREND"
+    if signal_type in ("REVERSAL", "RANGE_REVERSION"):
+        return signal_type
+
+    return "TREND"
 
 
 def get_position_pool_counts(trade_state, open_positions):
     pools = {
         "TREND": _empty_position_counts(),
         "REVERSAL": _empty_position_counts(),
+        "RANGE_REVERSION": _empty_position_counts(),
     }
 
     for symbol, amount in (open_positions or {}).items():
@@ -8663,6 +8740,7 @@ def get_tp1_runner_pool_counts(trade_state, open_positions):
     pools = {
         "TREND": _empty_position_counts(),
         "REVERSAL": _empty_position_counts(),
+        "RANGE_REVERSION": _empty_position_counts(),
     }
 
     if not getattr(config, "TP1_EXTRA_SLOTS_ENABLED", False):
@@ -8720,13 +8798,25 @@ def check_entry_position_limits(
     runner_pool_counts=None,
 ):
     reversal_signal = signal_type == "REVERSAL"
-    pool = "REVERSAL" if reversal_signal else "TREND"
+    range_reversion_signal = signal_type == "RANGE_REVERSION"
+
+    if reversal_signal:
+        pool = "REVERSAL"
+    elif range_reversion_signal:
+        pool = "RANGE_REVERSION"
+    else:
+        pool = "TREND"
+
     counts = pool_counts.get(pool, _empty_position_counts())
 
     if reversal_signal:
         total_limit = getattr(config, "REVERSAL_EXTRA_TOTAL_POSITIONS", 0)
         buy_limit = getattr(config, "REVERSAL_EXTRA_BUY_POSITIONS", 0)
         sell_limit = getattr(config, "REVERSAL_EXTRA_SELL_POSITIONS", 0)
+    elif range_reversion_signal:
+        total_limit = getattr(config, "RANGE_REVERSION_TOTAL_POSITIONS", 0)
+        buy_limit = getattr(config, "RANGE_REVERSION_BUY_POSITIONS", 0)
+        sell_limit = getattr(config, "RANGE_REVERSION_SELL_POSITIONS", 0)
     else:
         total_limit = config.MAX_TOTAL_POSITIONS
         buy_limit = config.MAX_BUY_POSITIONS
@@ -9046,6 +9136,7 @@ def execute_entry_candidate(
                     llm_context=llm_context,
                     market_context=candidate.get("market_context"),
                     rank_score=candidate.get("rank_score"),
+                    guard_context=guard_info,
                 )
                 return position_details, open_positions, False
 
@@ -9058,6 +9149,8 @@ def execute_entry_candidate(
 
         if side_analysis.get("confirmation_type") == "REVERSAL":
             min_room_override = config.REVERSAL_MIN_TP_ROOM_ROI
+        elif side_analysis.get("confirmation_type") == "RANGE_REVERSION":
+            min_room_override = config.RANGE_REVERSION_MIN_TP_ROOM_ROI
 
         room_ok, room_info = validate_entry_profit_room(
             signal,
@@ -9873,6 +9966,17 @@ def finalize_scanned_symbol(
     rs = scan_item["rs"]
 
     log_signal_analysis(final_analysis)
+
+    try:
+        record_volume_profile_telemetry(
+            symbol,
+            config.CONFIRMATION_TIMEFRAME,
+            confirm_df,
+            structure=detect_market_structure(confirm_df),
+        )
+    except Exception as e:
+        log_warning(f"{symbol} volume profile telemetry error: {e}")
+
     signal = final_analysis["signal"]
 
     if not signal:
@@ -10420,6 +10524,7 @@ def run_bot():
                         candidate,
                         flow_monitor,
                         breadth_context,
+                        shadow_flow_monitor,
                     )
                     attach_candidate_shadow_order_flow(
                         candidate,

@@ -4598,7 +4598,11 @@ def get_roi_take_profit(side, entry_price, roi, precision):
 
 def _normalise_signal_type(signal_type=None):
     signal_type = str(signal_type or "").upper().strip()
-    return "REVERSAL" if signal_type == "REVERSAL" else "TREND"
+
+    if signal_type in ("REVERSAL", "RANGE_REVERSION"):
+        return signal_type
+
+    return "TREND"
 
 
 def is_stop_loss_enabled_for_signal(signal_type=None):
@@ -4606,6 +4610,9 @@ def is_stop_loss_enabled_for_signal(signal_type=None):
 
     if signal_type == "REVERSAL":
         return bool(getattr(config, "REVERSAL_SL_ENABLED", config.SL_ENABLED))
+
+    if signal_type == "RANGE_REVERSION":
+        return bool(getattr(config, "RANGE_REVERSION_SL_ENABLED", config.SL_ENABLED))
 
     if signal_type == "TREND":
         return bool(getattr(config, "TREND_SL_ENABLED", config.SL_ENABLED))
@@ -4618,6 +4625,11 @@ def get_max_sl_roi_for_signal(signal_type=None):
 
     if trade_type == "REVERSAL":
         return float(getattr(config, "REVERSAL_MAX_SL_ROI", config.MAX_SL_ROI))
+
+    if trade_type == "RANGE_REVERSION":
+        return float(
+            getattr(config, "RANGE_REVERSION_MAX_SL_ROI", config.MAX_SL_ROI)
+        )
 
     return float(getattr(config, "TREND_MAX_SL_ROI", config.MAX_SL_ROI))
 

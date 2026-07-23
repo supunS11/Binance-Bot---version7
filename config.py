@@ -264,6 +264,20 @@ SIGNAL_RANKING_QUALITY_WEIGHT = env_float("SIGNAL_RANKING_QUALITY_WEIGHT", 1.5)
 SIGNAL_RANKING_FLOW_WEIGHT = env_float("SIGNAL_RANKING_FLOW_WEIGHT", 1.2)
 SIGNAL_RANKING_SMC_WEIGHT = env_float("SIGNAL_RANKING_SMC_WEIGHT", 1.0)
 SIGNAL_RANKING_REGIME_WEIGHT = env_float("SIGNAL_RANKING_REGIME_WEIGHT", 1.0)
+# Promotes order_flow_shadow's footprint/impact/CVD analytics into a bounded
+# ranking contribution, reusing its existing buy/sell_shadow_score fields the
+# same way MARKET_FLOW_RANK_WEIGHT already uses MarketFlowMonitor's scores.
+# Ships disabled: this is separate from and does not alter the module's
+# existing shadow-only telemetry snapshot (attach_candidate_shadow_order_flow
+# / candidate["shadow_order_flow"]), which remains observation-only.
+SIGNAL_RANKING_ORDERFLOW_ENABLED = env_bool(
+    "SIGNAL_RANKING_ORDERFLOW_ENABLED",
+    "False"
+)
+SIGNAL_RANKING_ORDERFLOW_WEIGHT = env_float(
+    "SIGNAL_RANKING_ORDERFLOW_WEIGHT",
+    1.0
+)
 TREND_TIMING_RESCUE_RANK_PENALTY = env_float(
     "TREND_TIMING_RESCUE_RANK_PENALTY",
     2.5
@@ -481,6 +495,26 @@ ORDER_FLOW_SHADOW_TELEMETRY_PATH = os.getenv(
 ORDER_FLOW_SHADOW_TELEMETRY_MIN_INTERVAL_SECONDS = env_float(
     "ORDER_FLOW_SHADOW_TELEMETRY_MIN_INTERVAL_SECONDS",
     30
+)
+
+# Observation-only volume profile (POC/VAH/VAL), logged alongside
+# detect_market_structure's read for comparison. Not imported by strategy.py
+# and does not affect signal ranking, filtering, sizing, or execution -
+# same shadow-mode principle as ORDER_FLOW_SHADOW above.
+VOLUME_PROFILE_TELEMETRY_ENABLED = env_bool(
+    "VOLUME_PROFILE_TELEMETRY_ENABLED",
+    "True"
+)
+VOLUME_PROFILE_LOOKBACK = env_int("VOLUME_PROFILE_LOOKBACK", 120)
+VOLUME_PROFILE_BINS = env_int("VOLUME_PROFILE_BINS", 24)
+VOLUME_PROFILE_VALUE_AREA_PCT = env_float("VOLUME_PROFILE_VALUE_AREA_PCT", 0.70)
+VOLUME_PROFILE_TELEMETRY_PATH = os.getenv(
+    "VOLUME_PROFILE_TELEMETRY_PATH",
+    "data/volume_profile_v7.csv"
+)
+VOLUME_PROFILE_TELEMETRY_MIN_INTERVAL_SECONDS = env_float(
+    "VOLUME_PROFILE_TELEMETRY_MIN_INTERVAL_SECONDS",
+    240
 )
 
 MARKET_BREADTH_ENABLED = env_bool("MARKET_BREADTH_ENABLED", "True")
@@ -1135,6 +1169,71 @@ CONTINUATION_PULLBACK_REQUIRE_BOTH_LIVE_TIMEFRAMES = env_bool(
     "CONTINUATION_PULLBACK_REQUIRE_BOTH_LIVE_TIMEFRAMES",
     "True"
 )
+# Range/mean-reversion fade at a validated boundary during a sideways
+# (low-ADX) regime. Ships disabled: RANGE_REVERSION_ENABLED defaults False
+# and the position pool defaults to 0 capacity, so flipping ENABLED alone
+# does not let it trade until slots are explicitly allocated below.
+RANGE_REVERSION_ENABLED = env_bool("RANGE_REVERSION_ENABLED", "False")
+RANGE_REVERSION_SIGNAL_THRESHOLD = env_float(
+    "RANGE_REVERSION_SIGNAL_THRESHOLD",
+    70
+)
+RANGE_REVERSION_CONFIDENCE_MAX_SCORE = env_float(
+    "RANGE_REVERSION_CONFIDENCE_MAX_SCORE",
+    12
+)
+RANGE_REVERSION_MIN_SIGNAL_EDGE = env_float(
+    "RANGE_REVERSION_MIN_SIGNAL_EDGE",
+    0
+)
+RANGE_REVERSION_MAX_LEVEL_ADVERSE_ROI = env_float(
+    "RANGE_REVERSION_MAX_LEVEL_ADVERSE_ROI",
+    8.0
+)
+RANGE_REVERSION_MIN_LEVEL_SCORE = env_float(
+    "RANGE_REVERSION_MIN_LEVEL_SCORE",
+    3.0
+)
+RANGE_REVERSION_RSI_OVERSOLD = env_float("RANGE_REVERSION_RSI_OVERSOLD", 32)
+RANGE_REVERSION_RSI_OVERBOUGHT = env_float("RANGE_REVERSION_RSI_OVERBOUGHT", 68)
+RANGE_REVERSION_MIN_QUALITY_SCORE = env_float(
+    "RANGE_REVERSION_MIN_QUALITY_SCORE",
+    0.0
+)
+RANGE_REVERSION_MIN_CONFIRM_SCORE = env_float(
+    "RANGE_REVERSION_MIN_CONFIRM_SCORE",
+    -3.0
+)
+RANGE_REVERSION_SL_ENABLED = env_bool("RANGE_REVERSION_SL_ENABLED", "True")
+RANGE_REVERSION_MAX_SL_ROI = env_float("RANGE_REVERSION_MAX_SL_ROI", 10.0)
+# A range fade targets the opposite boundary, not a trend-sized move -
+# ENTRY_MIN_TP_ROOM_ROI's 30% default (tuned for trend) would reject nearly
+# every range trade. REVERSAL gets the same kind of override; this mirrors it.
+RANGE_REVERSION_MIN_TP_ROOM_ROI = env_float(
+    "RANGE_REVERSION_MIN_TP_ROOM_ROI",
+    5.0
+)
+# Own time-exit budget: a range fade should resolve quickly or the sideways
+# thesis is questionable. Without these, a range position silently inherited
+# TREND's 480-minute window and TREND_TIME_EXIT label (confirmed via backtest:
+# the one historical range trade found was closed by this, not its own
+# structure TP or SL).
+TIME_EXIT_RANGE_REVERSION_ENABLED = env_bool(
+    "TIME_EXIT_RANGE_REVERSION_ENABLED",
+    "True"
+)
+TIME_EXIT_RANGE_REVERSION_MINUTES = env_float(
+    "TIME_EXIT_RANGE_REVERSION_MINUTES",
+    180
+)
+TIME_EXIT_RANGE_REVERSION_MAX_ROI = env_float(
+    "TIME_EXIT_RANGE_REVERSION_MAX_ROI",
+    0
+)
+RANGE_REVERSION_TOTAL_POSITIONS = env_int("RANGE_REVERSION_TOTAL_POSITIONS", 0)
+RANGE_REVERSION_BUY_POSITIONS = env_int("RANGE_REVERSION_BUY_POSITIONS", 0)
+RANGE_REVERSION_SELL_POSITIONS = env_int("RANGE_REVERSION_SELL_POSITIONS", 0)
+
 REVERSAL_MODE_ENABLED = env_bool("REVERSAL_MODE_ENABLED", "True")
 REVERSAL_ENTRY_ENABLED = env_bool("REVERSAL_ENTRY_ENABLED", "True")
 REVERSAL_SIGNAL_THRESHOLD = env_float("REVERSAL_SIGNAL_THRESHOLD", 80)

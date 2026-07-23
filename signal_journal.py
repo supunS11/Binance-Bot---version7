@@ -114,6 +114,12 @@ FIELDNAMES = [
     "llm_reason",
     "llm_model",
     "skip_reason",
+    "live_guard_fast_chase_atr",
+    "live_guard_slow_chase_atr",
+    "live_guard_fast_ema_wrong_side",
+    "live_guard_slow_ema_wrong_side",
+    "live_guard_fast_support_score",
+    "live_guard_slow_support_score",
 ]
 
 
@@ -228,6 +234,7 @@ def append_signal_journal(
     market_context=None,
     signal_id="",
     rank_score="",
+    guard_context=None,
 ):
     if not config.SIGNAL_JOURNAL_ENABLED:
         return
@@ -242,6 +249,9 @@ def append_signal_journal(
         news_context = news_context or {}
         llm_context = llm_context or {}
         market_context = market_context or {}
+        guard_context = guard_context or {}
+        guard_fast = guard_context.get("fast") or {}
+        guard_slow = guard_context.get("slow") or {}
         flow = market_context.get("flow") or {}
         breadth = market_context.get("breadth") or {}
         transition = market_context.get("transition") or {}
@@ -400,6 +410,12 @@ def append_signal_journal(
             "llm_reason": llm_context.get("reason", ""),
             "llm_model": llm_context.get("model", ""),
             "skip_reason": skip_reason,
+            "live_guard_fast_chase_atr": guard_fast.get("ema_chase_atr", ""),
+            "live_guard_slow_chase_atr": guard_slow.get("ema_chase_atr", ""),
+            "live_guard_fast_ema_wrong_side": guard_fast.get("ema_wrong_side", ""),
+            "live_guard_slow_ema_wrong_side": guard_slow.get("ema_wrong_side", ""),
+            "live_guard_fast_support_score": guard_fast.get("support_score", ""),
+            "live_guard_slow_support_score": guard_slow.get("support_score", ""),
         }
 
         with path.open("a", newline="", encoding="utf-8") as file:
