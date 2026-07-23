@@ -465,7 +465,8 @@ def check_live_entry_guard(
     side,
     current_price,
     mark_price=None,
-    require_both_override=None
+    require_both_override=None,
+    confidence=None
 ):
     if not config.LIVE_ENTRY_CONFIRMATION_ENABLED:
         return True, current_price, {"reason": "LIVE_ENTRY_GUARD_DISABLED"}
@@ -507,7 +508,8 @@ def check_live_entry_guard(
         fast_guard_df,
         slow_guard_df,
         mark_price,
-        require_both_override=require_both_override
+        require_both_override=require_both_override,
+        confidence=confidence
     )
 
     return guard_ok, current_price, guard_info
@@ -9115,7 +9117,11 @@ def execute_entry_candidate(
                 symbol,
                 signal,
                 current_price,
-                require_both_override=True if require_both_live else None
+                require_both_override=True if require_both_live else None,
+                confidence=side_analysis.get(
+                    "confidence",
+                    final_analysis.get("best_confidence", 0)
+                )
             )
 
             if not guard_ok:

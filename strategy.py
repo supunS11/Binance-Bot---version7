@@ -763,7 +763,7 @@ def _adverse_zone(side, entry_price, leverage=None):
     return entry_price, entry_price * (1 + max_price_move)
 
 
-def _live_entry_timeframe_check(side, df, mark_price, label):
+def _live_entry_timeframe_check(side, df, mark_price, label, confidence=None):
     data = _closed_data(df)
     lookback = get_config_int("LIVE_ENTRY_STRUCTURE_LOOKBACK", 12)
 
@@ -800,6 +800,20 @@ def _live_entry_timeframe_check(side, df, mark_price, label):
     min_body_atr = get_config_float("LIVE_ENTRY_MIN_REVERSAL_BODY_ATR", 0.35)
     close_pos_limit = get_config_float("LIVE_ENTRY_REVERSAL_CLOSE_POSITION", 0.30)
     max_chase_atr = get_config_float("MAX_LIVE_ENTRY_CHASE_ATR", 0.50)
+
+    if (
+        getattr(config, "LIVE_ENTRY_CHASE_RELAX_ENABLED", False)
+        and confidence is not None
+        and _safe_float(confidence) >= get_config_float(
+            "LIVE_ENTRY_CHASE_RELAX_MIN_CONFIDENCE",
+            95.0
+        )
+    ):
+        max_chase_atr = max(
+            max_chase_atr,
+            get_config_float("LIVE_ENTRY_CHASE_RELAXED_MAX_ATR", 1.2)
+        )
+
     ema_tolerance_pct = get_config_float("LIVE_ENTRY_EMA_TOLERANCE_PCT", 0.08)
     max_close_position = get_config_float("MAX_LIVE_ENTRY_CLOSE_POSITION", 0.88)
     close_position = _close_position(latest)
@@ -919,7 +933,8 @@ def validate_live_entry_guard(
     fast_df,
     slow_df,
     mark_price,
-    require_both_override=None
+    require_both_override=None,
+    confidence=None
 ):
     if not config.LIVE_ENTRY_CONFIRMATION_ENABLED:
         return True, {"reason": "LIVE_ENTRY_GUARD_DISABLED"}
@@ -934,13 +949,15 @@ def validate_live_entry_guard(
         side,
         fast_df,
         mark_price,
-        config.LIVE_ENTRY_FAST_TIMEFRAME
+        config.LIVE_ENTRY_FAST_TIMEFRAME,
+        confidence=confidence
     )
     slow = _live_entry_timeframe_check(
         side,
         slow_df,
         mark_price,
-        config.LIVE_ENTRY_SLOW_TIMEFRAME
+        config.LIVE_ENTRY_SLOW_TIMEFRAME,
+        confidence=confidence
     )
     structure_break = fast["structure_break"] or slow["structure_break"]
     dual_reversal = fast["opposite_reversal"] and slow["opposite_reversal"]

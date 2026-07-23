@@ -81,6 +81,30 @@ class LiveEntryGuardDataTests(unittest.TestCase):
         self.assertIs(validate.call_args.args[1], fast_enriched)
         self.assertIs(validate.call_args.args[2], slow_enriched)
 
+    def test_live_guard_forwards_confidence_to_validation(self):
+        fast_raw = rising_klines()
+        slow_raw = rising_klines()
+
+        with patch(
+            "main.get_klines",
+            side_effect=[fast_raw, slow_raw],
+        ), patch(
+            "main.apply_indicators",
+            side_effect=[fast_raw, slow_raw],
+        ), patch(
+            "main.validate_live_entry_guard",
+            return_value=(True, {"reason": "TEST_OK"}),
+        ) as validate:
+            main.check_live_entry_guard(
+                "BTCUSDT",
+                "BUY",
+                100,
+                mark_price=101,
+                confidence=97,
+            )
+
+        self.assertEqual(validate.call_args.kwargs["confidence"], 97)
+
     def test_enriched_live_guard_uses_ema_and_oscillator_data(self):
         raw = rising_klines()
         mark_price = float(raw.iloc[-1]["close"])
