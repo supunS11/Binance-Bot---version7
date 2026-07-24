@@ -142,6 +142,80 @@ class LlmServiceTests(unittest.TestCase):
             self.assertTrue(llm_service._is_quota_error(metadata))
             self.assertEqual(llm_service._rate_limit_delay(metadata), 21600)
 
+    def test_malformed_header_delay_is_capped_not_left_unbounded(self):
+        metadata = {
+            "retry_after_seconds": 0,
+            "request_reset_seconds": 4_536_919,
+            "token_reset_seconds": 0,
+        }
+
+        with patch.multiple(
+            config,
+            LLM_RATE_LIMIT_BACKOFF_SECONDS=900,
+            LLM_RATE_LIMIT_SAFETY_SECONDS=1,
+            LLM_MAX_BACKOFF_SECONDS=43200,
+        ):
+            delay = llm_service._rate_limit_delay(metadata)
+
+        self.assertEqual(delay, 43200)
+
+    def test_quota_delay_is_also_capped_by_max_backoff(self):
+        metadata = {
+            "error_type": "insufficient_quota",
+            "error_code": "insufficient_quota",
+            "error_message": "Check your plan and billing details",
+        }
+
+        with patch.multiple(
+            config,
+            LLM_QUOTA_BACKOFF_SECONDS=999_999,
+            LLM_MAX_BACKOFF_SECONDS=43200,
+        ):
+            self.assertEqual(llm_service._rate_limit_delay(metadata), 43200)
+
+    def test_local_backoff_until_caps_a_provided_metadata_value(self):
+        now = time.time()
+
+        with patch.object(config, "LLM_MAX_BACKOFF_SECONDS", 43200):
+            capped = llm_service._local_backoff_until(
+                now,
+                "LLM_RATE_LIMITED",
+                {"backoff_until": now + 4_536_919}
+            )
+
+        self.assertAlmostEqual(capped, now + 43200, delta=1)
+
+    def test_local_backoff_until_stays_uncapped_for_normal_delays(self):
+        now = time.time()
+
+        with patch.multiple(
+            config,
+            LLM_RATE_LIMIT_BACKOFF_SECONDS=900,
+            LLM_MAX_BACKOFF_SECONDS=43200,
+        ):
+            normal = llm_service._local_backoff_until(
+                now,
+                "LLM_RATE_LIMITED",
+                {}
+            )
+
+        self.assertAlmostEqual(normal, now + 900, delta=1)
+
+    def test_exhausted_success_headers_backoff_is_capped(self):
+        with patch.object(config, "LLM_MAX_BACKOFF_SECONDS", 43200), patch.object(
+            config, "LLM_RATE_LIMIT_SAFETY_SECONDS", 1
+        ), patch.object(llm_service, "_register_shared_backoff") as register:
+            llm_service._register_exhausted_success_headers({
+                "remaining_requests": 0,
+                "remaining_tokens": 5,
+                "request_reset_seconds": 4_536_919,
+                "token_reset_seconds": 0,
+            })
+
+        self.assertEqual(register.call_count, 1)
+        backoff_until = register.call_args.args[0]
+        self.assertLessEqual(backoff_until, time.time() + 43200 + 1)
+
     def test_batch_review_is_reused_by_entry_filter_and_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "llm_cache.json"

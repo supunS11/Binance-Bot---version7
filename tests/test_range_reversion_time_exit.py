@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import config
+from strategy import time_exit_requires_weakness
 
 with patch("binance.client.Client.ping", return_value={}), patch(
     "binance.client.Client.get_server_time",
@@ -98,6 +99,112 @@ class TimeExitRouteTests(unittest.TestCase):
                 99.0,
             )
         self.assertEqual(context["route"], "RANGE_REVERSION")
+
+
+class TimeExitRequiresWeaknessTests(unittest.TestCase):
+    def test_trend_falls_back_to_global_default(self):
+        with patch.object(config, "TIME_EXIT_REQUIRE_WEAKNESS", True):
+            self.assertTrue(time_exit_requires_weakness("TREND"))
+
+        with patch.object(config, "TIME_EXIT_REQUIRE_WEAKNESS", False):
+            self.assertFalse(time_exit_requires_weakness("TREND"))
+
+    def test_range_reversion_uses_its_own_override(self):
+        with patch.object(config, "TIME_EXIT_REQUIRE_WEAKNESS", True), \
+                patch.object(
+                    config,
+                    "TIME_EXIT_RANGE_REVERSION_REQUIRE_WEAKNESS",
+                    False,
+                ):
+            self.assertFalse(time_exit_requires_weakness("RANGE_REVERSION"))
+            self.assertTrue(time_exit_requires_weakness("TREND"))
+
+    def test_missing_route_defaults_to_trend_behavior(self):
+        with patch.object(config, "TIME_EXIT_REQUIRE_WEAKNESS", True):
+            self.assertTrue(time_exit_requires_weakness(None))
+            self.assertTrue(time_exit_requires_weakness(""))
+
+
+class TimeExitWeaknessGateTests(unittest.TestCase):
+    """A flat/losing range-reversion trade bets on mean reversion, so the
+    trend-continuation weakness check almost never confirms for it - it was
+    silently stuck waiting for a signal that couldn't fire. RANGE_REVERSION
+    gets its own require-weakness switch instead of inheriting TREND's."""
+
+    def _run(self, require_weakness):
+        state = {"positions": {"BTCUSDT": position_state()}}
+        pending_updates = []
+
+        def fake_update(_state, _symbol, updates):
+            pending_updates.append(updates)
+            return True
+
+        settings = {
+            "TIME_EXIT_ENABLED": True,
+            "TIME_EXIT_RANGE_REVERSION_ENABLED": True,
+            "TIME_EXIT_RANGE_REVERSION_MINUTES": 180,
+            "TIME_EXIT_RANGE_REVERSION_MAX_ROI": 0,
+            "TIME_EXIT_RANGE_REVERSION_REQUIRE_WEAKNESS": require_weakness,
+            "TIME_EXIT_POST_DCA_GRACE_MINUTES": 0,
+            "TIME_EXIT_CHECK_SECONDS": 0,
+            "TIME_EXIT_REQUIRE_DATA": False,
+        }
+        config_patches = [
+            patch.object(config, name, value) for name, value in settings.items()
+        ]
+
+        for config_patch in config_patches:
+            config_patch.start()
+
+        try:
+            with patch.object(
+                main, "seconds_since", return_value=200 * 60
+            ), patch.object(
+                main, "coordinated_position_management_enabled", return_value=True
+            ), patch.object(
+                main, "runner_owns_position", return_value=False
+            ), patch.object(
+                main, "get_signal_frames", return_value=(None, None, None)
+            ), patch.object(
+                main,
+                "evaluate_time_exit_weakness",
+                return_value={
+                    "should_exit": False,
+                    "reason": "TIME_EXIT_WEAKNESS_INCOMPLETE",
+                    "evidence": [],
+                    "weakness_score": 0,
+                },
+            ), patch.object(
+                main, "load_trade_state", return_value=state
+            ), patch.object(
+                main, "committed_position_exit_owner", return_value=""
+            ), patch.object(
+                main, "update_position_runtime_fields", side_effect=fake_update
+            ), patch.object(
+                main, "get_open_position_details", return_value=None
+            ):
+                main.DcaWebsocketMonitor()._handle_time_exit(
+                    "BTCUSDT",
+                    99.0,
+                    state,
+                )
+        finally:
+            for config_patch in reversed(config_patches):
+                config_patch.stop()
+
+        return pending_updates
+
+    def test_range_reversion_exits_without_waiting_on_trend_weakness(self):
+        updates = self._run(require_weakness=False)
+
+        self.assertTrue(
+            any(u.get("time_exit_status") == "PENDING" for u in updates)
+        )
+
+    def test_trend_style_weakness_requirement_still_blocks_when_opted_in(self):
+        updates = self._run(require_weakness=True)
+
+        self.assertEqual(updates, [])
 
 
 if __name__ == "__main__":

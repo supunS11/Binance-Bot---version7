@@ -58,6 +58,7 @@ from strategy import (
     evaluate_route_early_invalidation,
     evaluate_route_profit_protection,
     evaluate_time_exit_weakness,
+    time_exit_requires_weakness,
     futures_context_priority,
     log_signal_analysis,
     should_fetch_futures_context,
@@ -7723,9 +7724,7 @@ class DcaWebsocketMonitor:
                 trend_df,
                 confirm_df,
             )
-        require_weakness = bool(
-            getattr(config, "TIME_EXIT_REQUIRE_WEAKNESS", True)
-        )
+        require_weakness = time_exit_requires_weakness(context.get("route"))
 
         if weakness.get("reason") == "TIME_EXIT_DATA_UNAVAILABLE":
             if getattr(config, "TIME_EXIT_REQUIRE_DATA", True):
@@ -9017,6 +9016,23 @@ def execute_entry_candidate(
 
         if not limit_ok:
             log_warning(limit_reason)
+            append_signal_journal(
+                symbol,
+                final_analysis,
+                participation,
+                trend_df,
+                confirm_df,
+                entry_df,
+                btc_trend,
+                btc_corr,
+                rs,
+                action="SKIPPED_POSITION_LIMIT",
+                skip_reason=limit_reason,
+                news_context=news_context,
+                llm_context=llm_context,
+                market_context=candidate.get("market_context"),
+                rank_score=candidate.get("rank_score"),
+            )
             return position_details, open_positions, False
 
         side_analysis = final_analysis.get(signal.lower(), {})

@@ -371,17 +371,32 @@ def _requires_provider_backoff(reason):
     )
 
 
+def _backoff_ceiling_seconds():
+    return max(float(getattr(config, "LLM_MAX_BACKOFF_SECONDS", 43200)), 1)
+
+
+def _capped_backoff_until(now, candidate_until):
+    ceiling = now + _backoff_ceiling_seconds()
+    return min(float(candidate_until or 0), ceiling)
+
+
 def _local_backoff_until(now, reason, metadata):
     metadata = metadata or {}
     provided = float(metadata.get("backoff_until", 0) or 0)
 
     if provided > now:
-        return provided
+        return _capped_backoff_until(now, provided)
 
     if str(reason or "").upper().startswith("LLM_QUOTA_EXCEEDED"):
-        return now + max(config.LLM_QUOTA_BACKOFF_SECONDS, 1)
+        return _capped_backoff_until(
+            now,
+            now + max(config.LLM_QUOTA_BACKOFF_SECONDS, 1)
+        )
 
-    return now + max(config.LLM_RATE_LIMIT_BACKOFF_SECONDS, 1)
+    return _capped_backoff_until(
+        now,
+        now + max(config.LLM_RATE_LIMIT_BACKOFF_SECONDS, 1)
+    )
 
 
 def _compact_level(side_data):
@@ -746,8 +761,10 @@ def _is_quota_error(metadata):
 
 
 def _rate_limit_delay(metadata):
+    ceiling = _backoff_ceiling_seconds()
+
     if _is_quota_error(metadata):
-        return max(float(config.LLM_QUOTA_BACKOFF_SECONDS), 1)
+        return min(max(float(config.LLM_QUOTA_BACKOFF_SECONDS), 1), ceiling)
 
     header_delay = max(
         float(metadata.get("retry_after_seconds", 0) or 0),
@@ -755,10 +772,11 @@ def _rate_limit_delay(metadata):
         float(metadata.get("token_reset_seconds", 0) or 0),
     )
     configured = max(float(config.LLM_RATE_LIMIT_BACKOFF_SECONDS), 1)
-    return max(header_delay, configured) + max(
+    delay = max(header_delay, configured) + max(
         float(config.LLM_RATE_LIMIT_SAFETY_SECONDS),
         0
     )
+    return min(delay, ceiling)
 
 
 def _register_exhausted_success_headers(metadata):
@@ -774,6 +792,7 @@ def _register_exhausted_success_headers(metadata):
 
     if delay > 0:
         delay += max(float(config.LLM_RATE_LIMIT_SAFETY_SECONDS), 0)
+        delay = min(delay, _backoff_ceiling_seconds())
         _register_shared_backoff(
             time.time() + delay,
             "LLM_RESPONSE_BUDGET_EXHAUSTED"

@@ -606,6 +606,7 @@ LLM_RATE_LIMIT_SAFETY_SECONDS = env_float(
     "LLM_RATE_LIMIT_SAFETY_SECONDS",
     1
 )
+LLM_MAX_BACKOFF_SECONDS = env_int("LLM_MAX_BACKOFF_SECONDS", 43200)
 LLM_RETRY_BASE_SECONDS = env_float("LLM_RETRY_BASE_SECONDS", 1)
 LLM_RETRY_MAX_SECONDS = env_float("LLM_RETRY_MAX_SECONDS", 8)
 
@@ -1241,6 +1242,19 @@ TIME_EXIT_RANGE_REVERSION_MINUTES = env_float(
 TIME_EXIT_RANGE_REVERSION_MAX_ROI = env_float(
     "TIME_EXIT_RANGE_REVERSION_MAX_ROI",
     0
+)
+# evaluate_time_exit_weakness() only checks trend continuation (4h/1d EMA
+# alignment, MACD, structure break) - the opposite of what a range fade bets
+# on. A range entry is taken *because* the trend looks weak (oversold RSI
+# near support), so this trend-weakness gate almost never confirms for this
+# route, letting a flat/losing range position run well past its own time
+# floor (confirmed via backtest: the one historical range trade held ~10h
+# past its 180-minute floor waiting for a "weakness" signal that couldn't
+# fire). Route gets its own require-weakness switch instead of inheriting
+# TREND's.
+TIME_EXIT_RANGE_REVERSION_REQUIRE_WEAKNESS = env_bool(
+    "TIME_EXIT_RANGE_REVERSION_REQUIRE_WEAKNESS",
+    "False"
 )
 RANGE_REVERSION_TOTAL_POSITIONS = env_int("RANGE_REVERSION_TOTAL_POSITIONS", 0)
 RANGE_REVERSION_BUY_POSITIONS = env_int("RANGE_REVERSION_BUY_POSITIONS", 0)

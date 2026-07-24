@@ -1168,6 +1168,17 @@ def evaluate_time_exit_weakness(side, trend_df, confirm_df):
         return unavailable
 
 
+def time_exit_requires_weakness(route):
+    route = str(route or "TREND").upper()
+    return bool(
+        getattr(
+            config,
+            f"TIME_EXIT_{route}_REQUIRE_WEAKNESS",
+            getattr(config, "TIME_EXIT_REQUIRE_WEAKNESS", True)
+        )
+    )
+
+
 def evaluate_route_early_invalidation(
     side,
     fast_df,

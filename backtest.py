@@ -18,6 +18,7 @@ from strategy import (
     evaluate_route_early_invalidation,
     evaluate_route_profit_protection,
     evaluate_time_exit_weakness,
+    time_exit_requires_weakness,
     validate_adverse_zone_level,
     validate_dca_continuation_guard,
     validate_dca_recovery_confirmation,
@@ -1182,7 +1183,7 @@ def simulate_trade(
                 )
                 should_exit = (
                     weakness.get("should_exit")
-                    if getattr(config, "TIME_EXIT_REQUIRE_WEAKNESS", True)
+                    if time_exit_requires_weakness(route)
                     else True
                 )
 
