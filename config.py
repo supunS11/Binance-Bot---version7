@@ -759,6 +759,10 @@ POSITION_MANAGEMENT_LEGACY_ENABLED = env_bool(
 STATIC_TP_ENABLED = env_bool("STATIC_TP_ENABLED", "True")
 STATIC_TP_ROI = env_float("STATIC_TP_ROI", env_float("ROI_PERCENT_TP", 6))
 ROI_PERCENT_TP = env_float("ROI_PERCENT_TP", STATIC_TP_ROI)
+# Lets REVERSAL-signal static TP use its own ROI target instead of always
+# sharing STATIC_TP_ROI with TREND - defaults to STATIC_TP_ROI so behavior
+# is unchanged until explicitly set differently in .env.
+REVERSAL_STATIC_TP_ROI = env_float("REVERSAL_STATIC_TP_ROI", STATIC_TP_ROI)
 STRUCTURE_TP_MIN_ROI = env_float("STRUCTURE_TP_MIN_ROI", 8)
 STRUCTURE_TP_MAX_ROI = env_float("STRUCTURE_TP_MAX_ROI", 120)
 STRUCTURE_TP_MIN_SCORE = env_float("STRUCTURE_TP_MIN_SCORE", 2.0)
@@ -996,6 +1000,10 @@ REVERSAL_SL_ENABLED = env_bool(
 )
 TREND_MAX_SL_ROI = env_float("TREND_MAX_SL_ROI", MAX_SL_ROI)
 REVERSAL_MAX_SL_ROI = env_float("REVERSAL_MAX_SL_ROI", 80)
+# When False, get_signal_stop_loss (exchange.py) skips the swing-based
+# structure stop entirely and always uses the static ROI-based cap above -
+# defaults to True so behavior is unchanged until explicitly disabled.
+STRUCTURE_SL_ENABLED = env_bool("STRUCTURE_SL_ENABLED", "True")
 REVERSAL_PROFIT_PROTECTION_ENABLED = env_bool(
     "REVERSAL_PROFIT_PROTECTION_ENABLED",
     "True"

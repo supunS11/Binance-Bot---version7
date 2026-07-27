@@ -380,6 +380,140 @@ class MultiTpMonitorHardeningTests(unittest.TestCase):
             "RUNNER_TP_OPEN_ORDER_QUERY_UNAVAILABLE",
         )
 
+    def test_runner_finds_and_cancels_untracked_old_sl_via_price_fallback(
+        self,
+    ):
+        # Real-world case: a position whose entry SL was reconciled from
+        # the exchange (e.g. sl_source=STARTUP_EXCHANGE_VERIFIED) rather
+        # than freshly placed this run never gets initial_sl_order_id
+        # populated, even though a real stop is still open on Binance.
+        # Without the price-based fallback lookup, the runner's own SL
+        # placement below fails forever with -4130 because the untracked
+        # old stop is never found and cancelled.
+        monitor = new_monitor()
+        position = runner_position(initial_sl_order_id="", sl_price=95)
+        state = {"positions": {SYMBOL: position}}
+
+        def matching_algo_order(
+            symbol, order_type, side, position_side=None,
+            trigger_price=None, close_position=None,
+        ):
+            if trigger_price == 95:
+                return {"query_ok": True, "order_id": 999}
+
+            return {"query_ok": True}
+
+        with patch(
+            "main.normalize_trigger_price",
+            side_effect=lambda symbol, side, order_type, price: float(price),
+        ), patch(
+            "main.find_matching_open_algo_order",
+            side_effect=matching_algo_order,
+        ), patch(
+            "main.place_close_position_protection",
+            side_effect=[{"algoId": 22}, {"algoId": 33}],
+        ) as place, patch(
+            "main.cancel_algo_order",
+            return_value=True,
+        ) as cancel, patch(
+            "main.update_position_runtime_fields",
+            side_effect=apply_updates,
+        ), patch(
+            "main.send_telegram_message",
+        ), patch.object(
+            monitor,
+            "_validate_runner_order_id",
+            return_value="OPEN",
+        ):
+            handled = monitor._configure_multi_tp_runner(
+                SYMBOL,
+                105,
+                state,
+                position,
+                {"quantity": 0.5, "position_side": "BOTH"},
+            )
+
+        self.assertTrue(handled)
+        cancel.assert_called_once_with(SYMBOL, 999)
+        self.assertEqual(place.call_args_list[0].args[2], "STOP_MARKET")
+        self.assertEqual(
+            place.call_args_list[1].args[2],
+            "TAKE_PROFIT_MARKET",
+        )
+        self.assertEqual(position["multi_tp_stage"], RUNNER_ACTIVE)
+
+    def test_runner_old_sl_fallback_lookup_failure_defers_safely(self):
+        monitor = new_monitor()
+        position = runner_position(initial_sl_order_id="", sl_price=95)
+        state = {"positions": {SYMBOL: position}}
+
+        with patch(
+            "main.normalize_trigger_price",
+            side_effect=lambda symbol, side, order_type, price: float(price),
+        ), patch(
+            "main.find_matching_open_algo_order",
+            return_value={"query_ok": False, "error": "temporary failure"},
+        ), patch(
+            "main.place_close_position_protection",
+        ) as place, patch(
+            "main.cancel_algo_order",
+        ) as cancel, patch(
+            "main.update_position_runtime_fields",
+            side_effect=apply_updates,
+        ):
+            handled = monitor._configure_multi_tp_runner(
+                SYMBOL,
+                105,
+                state,
+                position,
+                {"quantity": 0.5, "position_side": "BOTH"},
+            )
+
+        self.assertFalse(handled)
+        place.assert_not_called()
+        cancel.assert_not_called()
+        self.assertEqual(
+            position["runner_protection_error"],
+            "RUNNER_OLD_SL_LOOKUP_UNAVAILABLE",
+        )
+
+    def test_runner_with_no_old_sl_anywhere_proceeds_unaffected(self):
+        # Sanity guard: when there truly is no old SL (no tracked id and
+        # no untracked one found on the exchange either), behavior must
+        # be unchanged from before this fallback existed.
+        monitor = new_monitor()
+        position = runner_position(initial_sl_order_id="", sl_price=95)
+        state = {"positions": {SYMBOL: position}}
+
+        with patch(
+            "main.normalize_trigger_price",
+            side_effect=lambda symbol, side, order_type, price: float(price),
+        ), patch(
+            "main.find_matching_open_algo_order",
+            return_value={"query_ok": True},
+        ), patch(
+            "main.place_close_position_protection",
+            side_effect=[{"algoId": 22}, {"algoId": 33}],
+        ) as place, patch(
+            "main.cancel_algo_order",
+        ) as cancel, patch(
+            "main.update_position_runtime_fields",
+            side_effect=apply_updates,
+        ), patch(
+            "main.send_telegram_message",
+        ):
+            handled = monitor._configure_multi_tp_runner(
+                SYMBOL,
+                105,
+                state,
+                position,
+                {"quantity": 0.5, "position_side": "BOTH"},
+            )
+
+        self.assertTrue(handled)
+        cancel.assert_not_called()
+        self.assertEqual(position["multi_tp_stage"], RUNNER_ACTIVE)
+
     def test_dca_tick_is_blocked_after_tp1_trigger_or_fill(self):
         for stage, trigger_seen_at in (
             (TP1_PENDING, "2026-07-19T12:00:00"),

@@ -4647,12 +4647,16 @@ def get_signal_stop_loss(side, entry_price, confirm_df, signal_type, precision):
     if not is_stop_loss_enabled_for_signal(signal_type):
         return None
 
-    structure_sl = get_structure_stop_loss(confirm_df, side)
     max_roi = get_max_sl_roi_for_signal(signal_type)
     capped_sl = None
 
     if max_roi > 0:
         capped_sl = get_roi_stop_loss(side, entry_price, max_roi, precision)
+
+    if not getattr(config, "STRUCTURE_SL_ENABLED", True):
+        return capped_sl
+
+    structure_sl = get_structure_stop_loss(confirm_df, side)
 
     if structure_sl is None:
         return capped_sl
@@ -5101,15 +5105,30 @@ def place_tp_sl(
                 precision
             )
         elif config.STATIC_TP_ENABLED:
-            effective_roi = float(config.STATIC_TP_ROI)
+            base_roi = (
+                float(
+                    getattr(
+                        config,
+                        "REVERSAL_STATIC_TP_ROI",
+                        config.STATIC_TP_ROI,
+                    )
+                )
+                if reversal_tp
+                else float(config.STATIC_TP_ROI)
+            )
+            effective_roi = base_roi
 
             if reversal_tp and reversal_max_roi > 0:
                 effective_roi = min(effective_roi, reversal_max_roi)
 
             tp_mode = (
                 f"REVERSAL_STATIC_CAPPED_ROI_{effective_roi}%"
-                if effective_roi != float(config.STATIC_TP_ROI)
-                else f"STATIC_ROI_{effective_roi}%"
+                if effective_roi != base_roi
+                else (
+                    f"REVERSAL_STATIC_ROI_{effective_roi}%"
+                    if reversal_tp
+                    else f"STATIC_ROI_{effective_roi}%"
+                )
             )
             tp_price = get_roi_take_profit(
                 side,

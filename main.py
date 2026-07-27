@@ -6753,6 +6753,86 @@ class DcaWebsocketMonitor:
 
                 runner_sl_order_id = ""
 
+        # Binance rejects a new closePosition STOP_MARKET while the
+        # original entry-time stop is still open in the same direction
+        # (APIError -4130: "An open stop or take profit order with GTE
+        # and closePosition in the direction is existing"). The old stop
+        # must be cancelled BEFORE the runner's own stop can be placed,
+        # not after - every runner transition was previously deadlocking
+        # here: the new stop could never be placed while the old one
+        # blocked it, and the old one was only ever cancelled once the
+        # new one had already succeeded.
+        position_state = get_position_state(state, symbol) or position_state
+        old_sl_order_id = position_state.get("initial_sl_order_id") or ""
+
+        if sl_required and not old_sl_order_id:
+            # initial_sl_order_id is not always populated - e.g. a position
+            # whose entry SL was reconciled/verified from the exchange
+            # (rather than freshly placed by this run) can still have a
+            # real stop open on Binance with no locally-tracked order id
+            # for it. Without this fallback lookup, the runner's own SL
+            # placement below fails forever with -4130 ("an open stop...
+            # is existing") because the untracked old stop is never found
+            # and cancelled.
+            entry_sl_price = _pending_execution_float(
+                position_state.get("sl_price")
+            )
+
+            if entry_sl_price > 0:
+                untracked_old_sl = find_matching_open_algo_order(
+                    symbol,
+                    "STOP_MARKET",
+                    close_side,
+                    position_side=position_side,
+                    trigger_price=entry_sl_price,
+                    close_position=True,
+                )
+
+                if untracked_old_sl.get("query_ok") is False:
+                    self._persist_multi_tp_updates(
+                        state,
+                        symbol,
+                        {
+                            "runner_protection_error":
+                            "RUNNER_OLD_SL_LOOKUP_UNAVAILABLE"
+                        },
+                        "RUNNER_OLD_SL_LOOKUP_UNAVAILABLE",
+                    )
+                    return False
+
+                old_sl_order_id = untracked_old_sl.get("order_id") or ""
+
+        if (
+            sl_required and
+            old_sl_order_id and
+            old_sl_order_id != runner_sl_order_id
+        ):
+            old_sl_state = self._validate_runner_order_id(
+                symbol,
+                old_sl_order_id,
+                "STOP_MARKET",
+                close_side,
+                position_side,
+            )
+
+            if old_sl_state == "OPEN":
+                if cancel_algo_order(symbol, old_sl_order_id):
+                    if not self._persist_multi_tp_updates(
+                        state,
+                        symbol,
+                        {"initial_sl_order_id": ""},
+                        "RUNNER_OLD_SL_CANCELLED",
+                    ):
+                        return False
+            elif old_sl_state in ("INVALID", "TERMINAL"):
+                if not self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"initial_sl_order_id": ""},
+                    "RUNNER_OLD_SL_STALE_CLEAR",
+                ):
+                    return False
+
         if sl_required and not runner_sl_order_id:
             matching_sl = find_matching_open_algo_order(
                 symbol,
@@ -6866,27 +6946,11 @@ class DcaWebsocketMonitor:
                     cancel_algo_order(symbol, runner_tp_order_id)
                 return False
 
+        # The old entry stop is now cancelled (or was never present) as a
+        # precondition of placing the runner stop above - read whatever is
+        # currently recorded rather than recomputing it.
         position_state = get_position_state(state, symbol) or position_state
-        old_sl_order_id = position_state.get("initial_sl_order_id") or ""
-        old_sl_remaining = old_sl_order_id
-
-        if old_sl_order_id and runner_sl_order_id:
-            if old_sl_order_id == runner_sl_order_id:
-                old_sl_remaining = ""
-            else:
-                old_sl_state = self._validate_runner_order_id(
-                    symbol,
-                    old_sl_order_id,
-                    "STOP_MARKET",
-                    close_side,
-                    position_side,
-                )
-
-                if old_sl_state == "OPEN":
-                    if cancel_algo_order(symbol, old_sl_order_id):
-                        old_sl_remaining = ""
-                elif old_sl_state in ("INVALID", "TERMINAL"):
-                    old_sl_remaining = ""
+        old_sl_remaining = position_state.get("initial_sl_order_id") or ""
 
         active_updates = {
             "multi_tp_stage": RUNNER_ACTIVE,
