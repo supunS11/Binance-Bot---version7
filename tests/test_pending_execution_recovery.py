@@ -84,6 +84,44 @@ def definitive_absence_result():
     }
 
 
+def mixed_terminal_and_absent_result(executed_quantity=0.4):
+    # An IOC entry that partially filled (one client-order-id is
+    # FOUND_TERMINAL) plus a residual fallback order the exchange rejected
+    # outright and thus never existed (DEFINITIVELY_ABSENT). order_terminal
+    # is False (not every id is literally terminal) but
+    # all_client_outcomes_resolved is True (every id's fate is known).
+    return {
+        "order_terminal": False,
+        "orders": [
+            {"status": "EXPIRED", "executedQty": str(executed_quantity)},
+        ],
+        "executed_quantity": executed_quantity,
+        "average_fill_price": 100.1,
+        "order_ids": "ioc-1",
+        "client_order_ids": "cid-ioc,cid-market",
+        "verification_attempts": 3,
+        "error": (
+            "APIError(code=-4164): Order's notional must be no smaller "
+            "than 5."
+        ),
+        "client_order_ids_valid": True,
+        "client_outcomes": [
+            {"client_order_id": "cid-ioc", "outcome": "FOUND_TERMINAL"},
+            {"client_order_id": "cid-market", "outcome": "DEFINITIVELY_ABSENT"},
+        ],
+        "all_client_outcomes_resolved": True,
+        "all_definitively_absent": False,
+        "any_order_seen": True,
+        "max_executed_quantity_seen": executed_quantity,
+        "lookup_uncertain": False,
+        "absence_evidence": {
+            "open_orders_sweep_ok": True,
+            "order_history_sweep_ok": True,
+            "definitive_count": 1,
+        },
+    }
+
+
 def safe_entry_submission_marker():
     return {
         "symbol": SYMBOL,
@@ -556,6 +594,194 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         self.assertEqual(persist_call.kwargs["pre_average_price"], 99.5)
         main_updates["reconcile_pending_executions"].assert_called_once_with(
             state
+        )
+
+    def test_mixed_terminal_and_absent_fallback_clears_once_protected(self):
+        # Real-world case: an IOC entry partially fills (terminal order)
+        # and the residual fallback order is rejected outright by the
+        # exchange (e.g. notional too small) - it can never become
+        # FOUND_TERMINAL since it was never accepted. Once every client
+        # order id is definitively accounted for and the resulting
+        # exposure is protected, the marker must clear instead of
+        # retrying forever.
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending_execution()},
+        }
+        live_detail = {
+            "amount": 0.4,
+            "side": "BUY",
+            "position_side": "BOTH",
+            "entry_price": 101.0,
+            "mark_price": 102.0,
+        }
+
+        with patch(
+            "main.reconcile_execution_client_orders",
+            return_value=mixed_terminal_and_absent_result(),
+        ), patch(
+            "main._pending_execution_live_detail",
+            return_value=(True, live_detail),
+        ), patch(
+            "main._secure_pending_execution_protection",
+            return_value=True,
+        ) as secure_protection, patch(
+            "main.remove_pending_execution",
+            side_effect=remove_in_memory,
+        ) as remove_pending, patch(
+            "main.fail_safe_close_unprotected_position",
+        ) as fail_safe_close, patch("main.log_warning"), patch(
+            "main.log_error"
+        ) as log_error:
+            main.reconcile_pending_executions(state)
+
+        secure_protection.assert_called_once()
+        remove_pending.assert_called_once_with(state, SYMBOL)
+        fail_safe_close.assert_not_called()
+        self.assertNotIn(SYMBOL, state["pending_executions"])
+        self.assertNotIn(SYMBOL, main.entry_quarantined_symbols)
+        self.assertFalse(
+            any(
+                "execution remains unsettled" in str(call.args[0])
+                for call in log_error.call_args_list
+            )
+        )
+
+    def test_mixed_terminal_and_absent_fallback_retains_marker_if_clear_fails(
+        self,
+    ):
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending_execution()},
+        }
+        live_detail = {
+            "amount": 0.4,
+            "side": "BUY",
+            "position_side": "BOTH",
+            "entry_price": 101.0,
+            "mark_price": 102.0,
+        }
+
+        with patch(
+            "main.reconcile_execution_client_orders",
+            return_value=mixed_terminal_and_absent_result(),
+        ), patch(
+            "main._pending_execution_live_detail",
+            return_value=(True, live_detail),
+        ), patch(
+            "main._secure_pending_execution_protection",
+            return_value=True,
+        ), patch(
+            "main.remove_pending_execution",
+            return_value=False,
+        ) as remove_pending, patch(
+            "main.fail_safe_close_unprotected_position",
+        ), patch("main.log_warning"), patch(
+            "main.log_error"
+        ) as log_error:
+            main.reconcile_pending_executions(state)
+
+        remove_pending.assert_called_once_with(state, SYMBOL)
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertTrue(
+            any(
+                "could not be cleared" in str(call.args[0])
+                for call in log_error.call_args_list
+            )
+        )
+        self.assertTrue(
+            any(
+                "execution remains unsettled" in str(call.args[0])
+                for call in log_error.call_args_list
+            )
+        )
+
+    def test_mixed_terminal_and_absent_fallback_not_cleared_for_dca_context(
+        self,
+    ):
+        # The new resolution path is scoped to ENTRY only - a DCA-context
+        # marker with the same mixed outcome keeps the existing (retry)
+        # behavior since DCA reservation cleanup semantics aren't covered
+        # by this fix.
+        pending = pending_execution(
+            context="DCA_LEVEL_1",
+            dca_level=1,
+            pre_position_amount=1.0,
+        )
+        state = {
+            "positions": {
+                SYMBOL: {"managed_by_bot": True, "pending_dca": {"level": 1}},
+            },
+            "pending_executions": {SYMBOL: pending},
+        }
+        live_detail = {
+            "amount": 1.4,
+            "side": "BUY",
+            "position_side": "BOTH",
+            "entry_price": 101.0,
+            "mark_price": 102.0,
+        }
+
+        with patch(
+            "main.reconcile_execution_client_orders",
+            return_value=mixed_terminal_and_absent_result(),
+        ), patch(
+            "main._pending_execution_live_detail",
+            return_value=(True, live_detail),
+        ), patch(
+            "main._secure_pending_execution_protection",
+            return_value=True,
+        ), patch(
+            "main.remove_pending_execution",
+            side_effect=remove_in_memory,
+        ) as remove_pending, patch(
+            "main.fail_safe_close_unprotected_position",
+        ), patch("main.log_warning"), patch(
+            "main.log_error"
+        ) as log_error:
+            main.reconcile_pending_executions(state)
+
+        remove_pending.assert_not_called()
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertTrue(
+            any(
+                "execution remains unsettled" in str(call.args[0])
+                for call in log_error.call_args_list
+            )
+        )
+
+    def test_all_client_outcomes_resolved_alone_does_not_clear_when_uncertain(
+        self,
+    ):
+        # Sanity guard: the existing "not all_client_outcomes_resolved"
+        # case (e.g. a transient lookup failure) must keep retrying, not
+        # be swept up by the new clear path.
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending_execution()},
+        }
+
+        with patch(
+            "main.reconcile_execution_client_orders",
+            return_value=terminal_result(False),
+        ), patch(
+            "main._pending_execution_live_detail",
+            return_value=(True, None),
+        ), patch(
+            "main.upsert_pending_execution",
+            side_effect=persist_in_memory,
+        ), patch(
+            "main.remove_pending_execution",
+        ) as remove_pending, patch("main.log_error") as log_error:
+            main.reconcile_pending_executions(state)
+
+        remove_pending.assert_not_called()
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertTrue(
+            any(
+                "execution remains unsettled" in str(call.args[0])
+                for call in log_error.call_args_list
+            )
         )
 
 

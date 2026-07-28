@@ -91,7 +91,7 @@ from llm_service import (
     begin_llm_scan_budget,
     prefetch_llm_candidate_reviews,
 )
-from news_service import apply_news_filter
+from news_service import apply_news_filter, prepare_news_scan_context
 from telegram_service import (
     send_order_opened_message,
     send_dca_filled_message,
@@ -1972,6 +1972,52 @@ def _pending_execution_age_seconds(pending):
         return None
 
 
+def _log_stuck_pending_executions(state):
+    threshold = max(
+        float(getattr(config, "PENDING_EXECUTION_STUCK_ALERT_SECONDS", 120)),
+        0,
+    )
+    repeat_seconds = max(
+        float(
+            getattr(
+                config,
+                "PENDING_EXECUTION_STUCK_ALERT_REPEAT_SECONDS",
+                60,
+            )
+        ),
+        1,
+    )
+
+    for symbol, pending in (state.get("pending_executions") or {}).items():
+        age = _pending_execution_age_seconds(pending)
+
+        if age is None or age < threshold:
+            continue
+
+        last_alert_age = pending.get("_stuck_alert_last_age")
+
+        if (
+            last_alert_age is not None and
+            age - float(last_alert_age) < repeat_seconds
+        ):
+            continue
+
+        pending["_stuck_alert_last_age"] = age
+        last_reconciliation = pending.get("last_reconciliation") or {}
+        lookup_uncertain = bool(last_reconciliation.get("lookup_uncertain"))
+        error_detail = str(last_reconciliation.get("error") or "").strip()
+        reason = (
+            "LOOKUP_UNCERTAIN"
+            if lookup_uncertain
+            else str(pending.get("last_absence_reset_reason") or "UNRESOLVED")
+        )
+        log_error(
+            f"{symbol} PENDING EXECUTION STUCK {round(age)}s | "
+            f"REASON={reason} | "
+            f"LAST_ERROR={error_detail or 'NONE'}"
+        )
+
+
 def _reset_pending_absence_confirmations(pending, reason):
     try:
         previous_count = int(
@@ -2817,6 +2863,32 @@ def reconcile_pending_executions(state, position_details=None):
                         "update could not be persisted; original marker "
                         "remains for retry"
                     )
+
+            # Reaching this point means any exposure the entry produced is
+            # already protected (or none resulted). order_terminal still
+            # requires every client-order-id to be literally FOUND_TERMINAL,
+            # which a residual order that was never accepted by the exchange
+            # (e.g. rejected for notional too small) can never become - every
+            # future query for it will keep returning "does not exist"
+            # forever. all_client_outcomes_resolved already recognizes that
+            # case (FOUND_TERMINAL or DEFINITIVELY_ABSENT for every id), so
+            # once it's true and the position is accounted for, there is
+            # nothing left to learn from retrying and the marker can clear.
+            if context == "ENTRY" and result.get("all_client_outcomes_resolved"):
+                removed = remove_pending_execution(state, symbol)
+
+                if removed is not False:
+                    entry_quarantined_symbols.discard(symbol)
+                    log_warning(
+                        f"{symbol} pending ENTRY execution fully resolved | "
+                        "ALL_CLIENT_ORDERS_ACCOUNTED_FOR"
+                    )
+                    continue
+
+                log_error(
+                    f"{symbol} fully-resolved pending ENTRY execution could "
+                    "not be cleared; marker retained for retry"
+                )
 
             log_error(
                 f"{symbol} execution remains unsettled | "
@@ -10001,6 +10073,7 @@ def process_ranked_entry_candidates(
         ranked = ranked[:config.SIGNAL_RANKING_MAX_CANDIDATES]
 
     log_info(f"SIGNAL RANKING | CANDIDATES={len(ranked)}")
+    prepare_news_scan_context([candidate["symbol"] for candidate in ranked])
     prefetch_llm_candidate_reviews(ranked)
 
     for index, candidate in enumerate(ranked, start=1):
@@ -10268,6 +10341,7 @@ def run_bot():
                     open_positions = get_open_position_amounts(position_details)
 
                     if trade_state.get("pending_executions"):
+                        _log_stuck_pending_executions(trade_state)
                         log_warning(
                             "Pending execution remains unresolved; strategy "
                             "scan is paused until its topology is safe"

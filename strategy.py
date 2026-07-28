@@ -270,7 +270,7 @@ def _level_strength_score(
 def _collect_pivot_levels(df, side, label, timeframe_weight):
     lookback = get_config_int("LONG_TERM_SR_LOOKBACK", 160)
     min_touches = get_config_int("LONG_TERM_SR_MIN_TOUCHES", 2)
-    data = df.tail(lookback).copy()
+    data = _closed_data(df, lookback)
 
     if len(data) < 20:
         return []
@@ -319,8 +319,8 @@ def _collect_pivot_levels(df, side, label, timeframe_weight):
 
 def _collect_ema_levels(df, side, label, timeframe_weight):
     lookback = get_config_int("LONG_TERM_SR_LOOKBACK", 160)
-    data = df.tail(lookback).copy()
-    latest = latest_closed(data)
+    data = _closed_data(df, lookback)
+    latest = data.iloc[-1]
     levels = []
     min_respects = max(get_config_int("LONG_TERM_SR_EMA_MIN_RESPECTS", 2), 0)
     tolerance = _level_tolerance(data)
@@ -2269,6 +2269,46 @@ def _market_regime_score(side, trend_df, confirm_df, entry_df):
         "breakout": breakout,
         "chase_atr": round(float(chase_atr), 2),
     }
+
+
+def _reversal_regime_score(side, regime_context):
+    """Re-interpret the shared regime read for REVERSAL's own REGIME check.
+
+    _market_regime_score() rewards trend_aligned/confirm_aligned - i.e. the
+    higher timeframes agreeing with the trade direction, which is exactly
+    right for TREND but backwards for REVERSAL: a reversal trades AGAINST
+    the prevailing trend by design (see _counter_trend_context, a required
+    gate). Using the TREND-oriented score unmodified meant a genuine
+    reversal setup - bearish structure, counter-trend satisfied - landed on
+    regime="trending" with trend_aligned=False and got penalized (-1.25)
+    for the exact condition its own thesis requires. This only affects
+    REVERSAL's REGIME check; _market_regime_score()'s return value used
+    everywhere else (TREND's composite score) is unchanged.
+    """
+    regime_context = regime_context or {}
+    regime = regime_context.get("regime")
+    trend_aligned = bool(regime_context.get("trend_aligned"))
+    confirm_aligned = bool(regime_context.get("confirm_aligned"))
+
+    if regime == "late_entry":
+        return -get_config_float("LATE_ENTRY_SCORE_PENALTY", 2.0)
+
+    if regime == "trending":
+        if not trend_aligned and not confirm_aligned:
+            return 0.5
+
+        if trend_aligned and confirm_aligned:
+            return -1.25
+
+        return 0
+
+    if regime == "sideways":
+        return 0.5 if regime_context.get("breakout") else -1.0
+
+    if regime == "breakout":
+        return 0.75 if confirm_aligned else 0
+
+    return 0
 
 
 def _ema_gap_score(side, candle):
@@ -4742,7 +4782,7 @@ def _side_signal_score(
         smc_score,
         smc_context,
         momentum_context,
-        regime_score,
+        _reversal_regime_score(side, regime_context),
         reversal_confidence,
         confirm_ok,
         entry_ok,

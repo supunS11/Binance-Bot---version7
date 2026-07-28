@@ -153,6 +153,20 @@ PENDING_EXECUTION_ORDER_HISTORY_LIMIT = env_int(
     "PENDING_EXECUTION_ORDER_HISTORY_LIMIT",
     1000,
 )
+# Purely diagnostic: once a pending-execution marker has been unresolved
+# longer than this, log its actual last-known reason/error at higher
+# severity instead of just the generic "scan is paused" line. Does not
+# change when/whether the marker clears - only what gets logged while it's
+# stuck, so operators can tell rate-limit backoff apart from a persistent
+# auth/network/clock fault.
+PENDING_EXECUTION_STUCK_ALERT_SECONDS = env_float(
+    "PENDING_EXECUTION_STUCK_ALERT_SECONDS",
+    120,
+)
+PENDING_EXECUTION_STUCK_ALERT_REPEAT_SECONDS = env_float(
+    "PENDING_EXECUTION_STUCK_ALERT_REPEAT_SECONDS",
+    60,
+)
 EXECUTION_RESIDUAL_RETRY_ATTEMPTS = env_int(
     "EXECUTION_RESIDUAL_RETRY_ATTEMPTS",
     1
