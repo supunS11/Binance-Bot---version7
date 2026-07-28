@@ -4,7 +4,20 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import config
 from order_flow_shadow import FUTURES_PUBLIC_STREAM_BASE, OrderFlowShadowMonitor
+
+
+class _IsolatedShadowSymbolsMixin:
+    """Every test in this file passes an explicit ``symbols`` list to the
+    monitor and expects it to be honored. ORDER_FLOW_SHADOW_SYMBOLS takes
+    priority over that argument when non-empty, so tests must not be at the
+    mercy of whatever the deployer's live .env happens to set it to."""
+
+    def setUp(self):
+        patcher = patch.object(config, "ORDER_FLOW_SHADOW_SYMBOLS", ())
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 class FakeClock:
@@ -70,7 +83,7 @@ def trade_event(clock, trade_id, *, event_type="trade", maker=False, quantity=1)
     return result
 
 
-class DepthSequenceTests(unittest.TestCase):
+class DepthSequenceTests(_IsolatedShadowSymbolsMixin, unittest.TestCase):
     def test_snapshot_plus_one_event_waits_for_required_snapshot_overlap(self):
         clock = FakeClock()
         provider = SnapshotProvider([snapshot(100)])
@@ -240,7 +253,7 @@ class DepthSequenceTests(unittest.TestCase):
         self.assertEqual(provider.calls, [])
 
 
-class BoundedStateTests(unittest.TestCase):
+class BoundedStateTests(_IsolatedShadowSymbolsMixin, unittest.TestCase):
     def test_queue_drops_oldest_without_blocking_and_trades_remain_bounded(self):
         clock = FakeClock()
         monitor = OrderFlowShadowMonitor(
@@ -305,7 +318,7 @@ class BoundedStateTests(unittest.TestCase):
         self.assertEqual(result["duplicate_trades"], 0)
 
 
-class ShadowMetricTests(unittest.TestCase):
+class ShadowMetricTests(_IsolatedShadowSymbolsMixin, unittest.TestCase):
     def test_depth_stream_uses_current_binance_public_route(self):
         self.assertEqual(
             FUTURES_PUBLIC_STREAM_BASE,
@@ -386,7 +399,7 @@ class ShadowMetricTests(unittest.TestCase):
         self.assertEqual(chunks[1], ("solusdt@depth@100ms",))
 
 
-class TelemetryTests(unittest.TestCase):
+class TelemetryTests(_IsolatedShadowSymbolsMixin, unittest.TestCase):
     def test_unsupported_depth_speed_falls_back_to_supported_100ms(self):
         monitor = OrderFlowShadowMonitor(
             ["BTCUSDT"],

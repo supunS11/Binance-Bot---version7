@@ -10052,6 +10052,28 @@ def execute_entry_candidate(
         return position_details, open_positions, False
 
 
+def _register_shadow_signal_outcome(candidate):
+    if not getattr(config, "SIGNAL_OUTCOME_SHADOW_TRACKING_ENABLED", True):
+        return
+
+    symbol = candidate.get("symbol")
+
+    try:
+        entry_df = candidate.get("entry_df")
+
+        if entry_df is None or len(entry_df) < 2:
+            return
+
+        reference_price = float(entry_df.iloc[-2].get("close", 0) or 0)
+
+        if reference_price <= 0:
+            return
+
+        register_signal_outcome(candidate, reference_price)
+    except Exception as exc:
+        log_warning(f"{symbol} shadow signal outcome registration error: {exc}")
+
+
 def process_ranked_entry_candidates(
     candidates,
     trade_state,
@@ -10086,7 +10108,7 @@ def process_ranked_entry_candidates(
             f"{candidate['symbol']} {candidate['signal']} | "
             f"SCORE={candidate.get('rank_score')}"
         )
-        position_details, open_positions, _ = execute_entry_candidate(
+        position_details, open_positions, executed = execute_entry_candidate(
             candidate,
             trade_state,
             position_details,
@@ -10094,6 +10116,9 @@ def process_ranked_entry_candidates(
             btc_trend_df,
             dca_monitor
         )
+
+        if not executed:
+            _register_shadow_signal_outcome(candidate)
 
         if state_requires_urgent_safety_retry(trade_state):
             log_warning(
