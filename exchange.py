@@ -1431,11 +1431,13 @@ def _get_algo_order(symbol, algo_id=None, client_algo_id=None):
         raise ValueError("algo_id or client_algo_id is required")
 
     method = getattr(client, "futures_get_algo_order", None)
+    request_weight = getattr(config, "ALGO_ORDER_QUERY_REQUEST_WEIGHT", 1)
 
     if method:
         return _private_rest_call(
             f"futures_get_algo_order:{symbol}",
             method,
+            weight=request_weight,
             **params,
         )
 
@@ -1445,6 +1447,7 @@ def _get_algo_order(symbol, algo_id=None, client_algo_id=None):
         "get",
         "algoOrder",
         True,
+        weight=request_weight,
         data=params,
     )
 

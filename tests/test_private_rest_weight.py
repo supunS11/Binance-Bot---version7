@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import config
 
@@ -84,6 +84,38 @@ class PositionInformationRequestWeightTests(unittest.TestCase):
             config, "POSITION_INFO_SYMBOL_REQUEST_WEIGHT", 1
         ):
             exchange._get_futures_position_information(symbol="BTCUSDT")
+
+        self.assertEqual(private_call.call_args.kwargs["weight"], 1)
+
+
+class AlgoOrderQueryRequestWeightTests(unittest.TestCase):
+    # futures_get_algo_order was confirmed via a real -1003 backoff log
+    # (ERROR= text) to be firing completely unpaced - reconciliation checks
+    # against open positions' SL/TP/DCA algo orders were invisible to the
+    # shared weight budget entirely.
+    def test_algo_order_lookup_via_client_method_is_weighted(self):
+        fake_method = Mock(return_value={})
+
+        with patch.object(
+            exchange.client, "futures_get_algo_order", fake_method, create=True
+        ), patch.object(
+            exchange, "_private_rest_call", return_value={}
+        ) as private_call, patch.object(
+            config, "ALGO_ORDER_QUERY_REQUEST_WEIGHT", 1
+        ):
+            exchange._get_algo_order("BTCUSDT", algo_id="123")
+
+        self.assertEqual(private_call.call_args.kwargs["weight"], 1)
+
+    def test_algo_order_lookup_via_fallback_request_is_weighted(self):
+        with patch.object(
+            exchange.client, "futures_get_algo_order", None, create=True
+        ), patch.object(
+            exchange, "_private_rest_call", return_value={}
+        ) as private_call, patch.object(
+            config, "ALGO_ORDER_QUERY_REQUEST_WEIGHT", 1
+        ):
+            exchange._get_algo_order("BTCUSDT", algo_id="123")
 
         self.assertEqual(private_call.call_args.kwargs["weight"], 1)
 
