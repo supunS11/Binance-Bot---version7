@@ -9109,7 +9109,7 @@ def execute_entry_candidate(
             )
             return position_details, open_positions, False
 
-        latest_position_details = get_open_position_details(force=True)
+        latest_position_details = get_open_position_details(force=False)
 
         if latest_position_details is None:
             log_warning(

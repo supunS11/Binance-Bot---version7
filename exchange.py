@@ -407,8 +407,11 @@ def _raise_if_private_rest_backoff(context):
     )
 
 
-def _private_rest_call(context, func, *args, **kwargs):
+def _private_rest_call(context, func, *args, weight=0, **kwargs):
     _raise_if_private_rest_backoff(context)
+
+    if weight > 0:
+        _rate_limit_public_request(weight)
 
     try:
         return func(*args, **kwargs)
@@ -657,6 +660,12 @@ def _get_futures_position_information(symbol=None, force=False):
     positions = _private_rest_call(
         f"futures_position_information:{symbol or 'all'}",
         client.futures_position_information,
+        weight=getattr(
+            config,
+            "POSITION_INFO_REQUEST_WEIGHT" if symbol is None
+            else "POSITION_INFO_SYMBOL_REQUEST_WEIGHT",
+            5 if symbol is None else 1
+        ),
         **params
     )
     _store_position_info(symbol, positions)
