@@ -120,5 +120,31 @@ class AlgoOrderQueryRequestWeightTests(unittest.TestCase):
         self.assertEqual(private_call.call_args.kwargs["weight"], 1)
 
 
+class FuturesToSpotTransferTests(unittest.TestCase):
+    def test_successful_transfer_uses_type_2_futures_to_spot(self):
+        with patch.object(
+            exchange, "_private_rest_call", return_value={"tranId": 1}
+        ) as private_call:
+            ok, result = exchange.transfer_futures_balance_to_spot("USDT", 137.5)
+
+        self.assertTrue(ok)
+        self.assertEqual(result, {"tranId": 1})
+        self.assertEqual(
+            private_call.call_args.kwargs,
+            {"asset": "USDT", "amount": 137.5, "type": 2},
+        )
+
+    def test_failed_transfer_returns_false_and_the_error_instead_of_raising(self):
+        with patch.object(
+            exchange,
+            "_private_rest_call",
+            side_effect=RuntimeError("APIError(code=-9000): insufficient balance"),
+        ):
+            ok, result = exchange.transfer_futures_balance_to_spot("USDT", 137.5)
+
+        self.assertFalse(ok)
+        self.assertIn("insufficient balance", result)
+
+
 if __name__ == "__main__":
     unittest.main()

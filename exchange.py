@@ -1077,8 +1077,25 @@ def get_balance():
     return 0
 
 
-def get_margin_balance():
-    return float(_get_futures_account()['totalMarginBalance'])
+def get_margin_balance(force=False):
+    return float(_get_futures_account(force=force)['totalMarginBalance'])
+
+
+def transfer_futures_balance_to_spot(asset, amount):
+    """Moves `amount` of `asset` from the USDⓈ-M futures wallet to spot.
+    type=2 is Binance's futures-account-transfer code for
+    futures -> spot (https://binance-docs.github.io/apidocs/futures/en/#new-future-account-transfer)."""
+    try:
+        response = _private_rest_call(
+            f"futures_account_transfer:{asset}",
+            client.futures_account_transfer,
+            asset=asset,
+            amount=amount,
+            type=2,
+        )
+        return True, response
+    except Exception as e:
+        return False, str(e)
 
 
 def get_unrealized_pnl():

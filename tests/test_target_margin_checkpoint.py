@@ -25,12 +25,27 @@ class TargetMarginCheckpointDoesNotStopTheBotTests(unittest.TestCase):
             main, "send_telegram_message"
         ), patch.object(
             main, "force_target_margin_process_exit"
-        ) as force_exit:
+        ) as force_exit, patch.object(
+            main, "transfer_target_margin_profit_to_spot"
+        ) as transfer:
             main.trigger_target_margin_checkpoint(2100)
 
         close_all.assert_called_once()
         force_exit.assert_not_called()
+        transfer.assert_called_once()
         self.assertFalse(main.shutdown_event.is_set())
+
+    def test_checkpoint_skips_transfer_when_close_did_not_succeed(self):
+        with patch.object(
+            main, "close_all_open_positions_for_target_stop", return_value=False
+        ), patch.object(
+            main, "send_telegram_message"
+        ), patch.object(
+            main, "transfer_target_margin_profit_to_spot"
+        ) as transfer:
+            main.trigger_target_margin_checkpoint(2100)
+
+        transfer.assert_not_called()
 
     def test_checkpoint_is_a_noop_once_shutdown_is_already_requested(self):
         main.shutdown_event.set()
@@ -41,6 +56,88 @@ class TargetMarginCheckpointDoesNotStopTheBotTests(unittest.TestCase):
             main.trigger_target_margin_checkpoint(2100)
 
         close_all.assert_not_called()
+
+
+class TargetMarginProfitTransferTests(unittest.TestCase):
+    def test_disabled_by_config_skips_everything(self):
+        with patch.object(
+            config, "TARGET_MARGIN_TRANSFER_ENABLED", False
+        ), patch.object(main, "get_margin_balance") as get_balance, patch.object(
+            main, "transfer_futures_balance_to_spot"
+        ) as transfer:
+            main.transfer_target_margin_profit_to_spot()
+
+        get_balance.assert_not_called()
+        transfer.assert_not_called()
+
+    def test_transfers_the_amount_above_target(self):
+        with patch.object(
+            config, "TARGET_MARGIN_TRANSFER_ENABLED", True
+        ), patch.object(
+            config, "TARGET_MARGIN_BALANCE", 2000
+        ), patch.object(
+            config, "TARGET_MARGIN_TRANSFER_ASSET", "USDT"
+        ), patch.object(
+            config, "TARGET_MARGIN_TRANSFER_MIN_AMOUNT", 1
+        ), patch.object(
+            main, "get_margin_balance", return_value=2137.5
+        ), patch.object(
+            main, "transfer_futures_balance_to_spot", return_value=(True, {})
+        ) as transfer, patch.object(
+            main, "send_telegram_message"
+        ) as telegram:
+            main.transfer_target_margin_profit_to_spot()
+
+        transfer.assert_called_once_with("USDT", 137.5)
+        telegram.assert_called_once()
+
+    def test_amount_below_minimum_is_not_transferred(self):
+        with patch.object(
+            config, "TARGET_MARGIN_TRANSFER_ENABLED", True
+        ), patch.object(
+            config, "TARGET_MARGIN_BALANCE", 2000
+        ), patch.object(
+            config, "TARGET_MARGIN_TRANSFER_MIN_AMOUNT", 5
+        ), patch.object(
+            main, "get_margin_balance", return_value=2002
+        ), patch.object(
+            main, "transfer_futures_balance_to_spot"
+        ) as transfer:
+            main.transfer_target_margin_profit_to_spot()
+
+        transfer.assert_not_called()
+
+    def test_balance_lookup_failure_does_not_raise(self):
+        with patch.object(
+            config, "TARGET_MARGIN_TRANSFER_ENABLED", True
+        ), patch.object(
+            main, "get_margin_balance", side_effect=RuntimeError("offline")
+        ), patch.object(
+            main, "transfer_futures_balance_to_spot"
+        ) as transfer:
+            main.transfer_target_margin_profit_to_spot()
+
+        transfer.assert_not_called()
+
+    def test_transfer_failure_is_logged_without_a_false_success_message(self):
+        with patch.object(
+            config, "TARGET_MARGIN_TRANSFER_ENABLED", True
+        ), patch.object(
+            config, "TARGET_MARGIN_BALANCE", 2000
+        ), patch.object(
+            config, "TARGET_MARGIN_TRANSFER_MIN_AMOUNT", 1
+        ), patch.object(
+            main, "get_margin_balance", return_value=2100
+        ), patch.object(
+            main,
+            "transfer_futures_balance_to_spot",
+            return_value=(False, "APIError(code=-9000): insufficient balance"),
+        ), patch.object(
+            main, "send_telegram_message"
+        ) as telegram:
+            main.transfer_target_margin_profit_to_spot()
+
+        telegram.assert_not_called()
 
 
 class TargetMarginMonitorRepeatingCheckpointTests(unittest.TestCase):

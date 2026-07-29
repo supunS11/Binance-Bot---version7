@@ -13,6 +13,7 @@ from exchange import (
     get_klines,
     get_balance,
     get_margin_balance,
+    transfer_futures_balance_to_spot,
     place_market_order,
     close_position_market,
     place_tp_sl,
@@ -5058,6 +5059,47 @@ def trigger_target_margin_checkpoint(margin_balance):
             "Target margin checkpoint closed all positions; "
             f"bot continues running | CLOSE_SUCCESS={close_success}"
         )
+
+        if close_success:
+            transfer_target_margin_profit_to_spot()
+
+
+def transfer_target_margin_profit_to_spot():
+    if not getattr(config, "TARGET_MARGIN_TRANSFER_ENABLED", False):
+        return
+
+    try:
+        fresh_balance = get_margin_balance(force=True)
+    except Exception as e:
+        log_error(f"Target margin transfer skipped | balance lookup failed: {e}")
+        return
+
+    transfer_amount = fresh_balance - config.TARGET_MARGIN_BALANCE
+    min_amount = max(float(config.TARGET_MARGIN_TRANSFER_MIN_AMOUNT), 0)
+
+    if transfer_amount < min_amount:
+        log_info(
+            "Target margin transfer skipped | "
+            f"amount above target ({round(transfer_amount, 2)}) is below "
+            f"TARGET_MARGIN_TRANSFER_MIN_AMOUNT ({min_amount})"
+        )
+        return
+
+    asset = config.TARGET_MARGIN_TRANSFER_ASSET
+    transfer_amount = round(transfer_amount, 8)
+    ok, result = transfer_futures_balance_to_spot(asset, transfer_amount)
+
+    if ok:
+        log_warning(
+            f"Target margin transfer | moved {transfer_amount} {asset} "
+            "from futures to spot | "
+            f"KEPT_IN_FUTURES={config.TARGET_MARGIN_BALANCE}"
+        )
+        send_telegram_message(
+            f"transferred {transfer_amount} {asset} profit to spot wallet"
+        )
+    else:
+        log_error(f"Target margin transfer failed | {result}")
 
 
 class TargetMarginBalanceMonitor:
