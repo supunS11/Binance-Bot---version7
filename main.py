@@ -5039,7 +5039,7 @@ def force_target_margin_process_exit(close_success):
     )
 
 
-def trigger_target_margin_stop(margin_balance):
+def trigger_target_margin_checkpoint(margin_balance):
     if shutdown_event.is_set():
         return
 
@@ -5047,15 +5047,17 @@ def trigger_target_margin_stop(margin_balance):
         if shutdown_event.is_set():
             return
 
-        shutdown_event.set()
         log_warning(
             "TARGET MARGIN BALANCE REACHED | "
             f"MARGIN_BALANCE={margin_balance} | "
             f"TARGET={config.TARGET_MARGIN_BALANCE}"
         )
-        send_telegram_message("target margin balance reached")
+        send_telegram_message("target margin balance reached; closing all positions")
         close_success = close_all_open_positions_for_target_stop()
-        force_target_margin_process_exit(close_success)
+        log_warning(
+            "Target margin checkpoint closed all positions; "
+            f"bot continues running | CLOSE_SUCCESS={close_success}"
+        )
 
 
 class TargetMarginBalanceMonitor:
@@ -5066,6 +5068,11 @@ class TargetMarginBalanceMonitor:
         )
         self.thread = None
         self.stop_event = threading.Event()
+        # Edge-triggered: only fires again once balance first drops back
+        # below TARGET_MARGIN_BALANCE and then climbs up to it again, so a
+        # closed, flat account sitting at/above target doesn't re-trigger
+        # every single check interval.
+        self.armed = True
 
     def start(self):
         if not self.enabled:
@@ -5103,6 +5110,31 @@ class TargetMarginBalanceMonitor:
         if thread is None or not thread.is_alive():
             self.thread = None
 
+    def _check_once(self, interval):
+        """Runs one balance check. Returns True if it already handled its
+        own wait (backoff path) and the caller should not wait again."""
+        backoff_remaining = get_private_rest_backoff_remaining()
+
+        if backoff_remaining > 0:
+            log_warning(
+                "Target margin balance monitor paused | "
+                "PRIVATE_REST_BACKOFF_ACTIVE | "
+                f"WAIT_SECONDS={round(backoff_remaining, 1)}"
+            )
+            self.stop_event.wait(max(backoff_remaining, interval))
+            return True
+
+        margin_balance = get_margin_balance()
+
+        if margin_balance >= config.TARGET_MARGIN_BALANCE:
+            if self.armed:
+                self.armed = False
+                trigger_target_margin_checkpoint(margin_balance)
+        else:
+            self.armed = True
+
+        return False
+
     def _run(self):
         interval = max(
             float(config.TARGET_MARGIN_BALANCE_CHECK_SECONDS),
@@ -5112,27 +5144,13 @@ class TargetMarginBalanceMonitor:
 
         while not self.stop_event.is_set() and not shutdown_event.is_set():
             try:
-                backoff_remaining = get_private_rest_backoff_remaining()
-
-                if backoff_remaining > 0:
-                    log_warning(
-                        "Target margin balance monitor paused | "
-                        "PRIVATE_REST_BACKOFF_ACTIVE | "
-                        f"WAIT_SECONDS={round(backoff_remaining, 1)}"
-                    )
-                    self.stop_event.wait(max(backoff_remaining, interval))
-                    continue
-
-                margin_balance = get_margin_balance()
-
-                if margin_balance >= config.TARGET_MARGIN_BALANCE:
-                    trigger_target_margin_stop(margin_balance)
-                    return
-
+                already_waited = self._check_once(interval)
             except Exception as e:
                 log_error(f"Target margin balance monitor error: {e}")
+                already_waited = False
 
-            self.stop_event.wait(interval)
+            if not already_waited:
+                self.stop_event.wait(interval)
 
 
 class DcaWebsocketMonitor:

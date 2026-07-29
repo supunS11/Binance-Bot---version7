@@ -130,7 +130,7 @@ class GracefulShutdownTests(unittest.TestCase):
             "send_telegram_message",
         ):
             monitor.thread = threading.Thread(
-                target=main.trigger_target_margin_stop,
+                target=main.trigger_target_margin_checkpoint,
                 args=(1000,),
                 daemon=True,
             )
