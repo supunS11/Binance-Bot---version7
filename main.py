@@ -8885,6 +8885,40 @@ def market_flow_hard_veto(candidate):
     return blocked, reason
 
 
+def regime_transition_hard_veto(candidate):
+    # Evidence: across ~7,000 recorded outcomes, a transition_score near
+    # zero (quiet/stable regime) wins 58.7% of the time, while EITHER a
+    # strongly opposing (42.9% win) OR strongly aligned (18.6% win) reading
+    # performs meaningfully worse - an active regime transition means the
+    # market is unpredictable right now, in either direction, not just
+    # "risky if it opposes the trade." Hence this checks abs(score), not
+    # just the conflicting side, unlike market_flow_hard_veto above.
+    if not getattr(config, "REGIME_TRANSITION_HARD_VETO_ENABLED", False):
+        return False, ""
+
+    signal = str(candidate.get("signal") or "").upper()
+    transition = (candidate.get("market_context") or {}).get("transition") or {}
+
+    if not transition:
+        return False, ""
+
+    side_key = signal.lower()
+    score = _safe_float(transition.get(f"{side_key}_score"))
+    abs_limit = max(
+        _safe_float(
+            getattr(config, "REGIME_TRANSITION_HARD_VETO_ABS_SCORE", 0.1)
+        ),
+        0,
+    )
+    blocked = abs_limit > 0 and abs(score) >= abs_limit
+    reason = (
+        f"ACTIVE_REGIME_TRANSITION SCORE={score} ABS_LIMIT={abs_limit}"
+        if blocked
+        else ""
+    )
+    return blocked, reason
+
+
 def get_candidate_signal_type(candidate):
     signal = candidate.get("signal")
     analysis = candidate.get("analysis") or {}
@@ -9163,6 +9197,30 @@ def execute_entry_candidate(
                 rs,
                 action="SKIPPED_MARKET_FLOW",
                 skip_reason=flow_reason,
+                news_context=news_context,
+                llm_context=llm_context,
+                market_context=candidate.get("market_context"),
+            )
+            return position_details, open_positions, False
+
+        transition_blocked, transition_reason = regime_transition_hard_veto(
+            candidate
+        )
+
+        if transition_blocked:
+            log_warning(f"{symbol} ENTRY BLOCKED | {transition_reason}")
+            append_signal_journal(
+                symbol,
+                final_analysis,
+                participation,
+                trend_df,
+                confirm_df,
+                entry_df,
+                btc_trend,
+                btc_corr,
+                rs,
+                action="SKIPPED_REGIME_TRANSITION",
+                skip_reason=transition_reason,
                 news_context=news_context,
                 llm_context=llm_context,
                 market_context=candidate.get("market_context"),
