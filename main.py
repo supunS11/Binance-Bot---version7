@@ -10192,6 +10192,51 @@ def _register_shadow_signal_outcome(candidate):
         log_warning(f"{symbol} shadow signal outcome registration error: {exc}")
 
 
+def _register_reversal_confirmation_shadow_outcomes(symbol, final_analysis, entry_df):
+    # REVERSAL_ENTRY_ENABLED=False forces reversal_ok to False and
+    # confirmation_type never becomes "REVERSAL" while disabled - but
+    # reversal_confirmed preserves the real, un-gated confirmation result
+    # (strategy.py _reversal_signal_check / chart_reversal_ok). This lets
+    # us measure real forward outcomes for reversal-confirmed setups
+    # while the feature stays off, evidence before any re-enable decision.
+    if not getattr(
+        config, "REVERSAL_CONFIRMATION_SHADOW_TRACKING_ENABLED", True
+    ):
+        return
+
+    try:
+        if entry_df is None or len(entry_df) < 2:
+            return
+
+        reference_price = float(entry_df.iloc[-2].get("close", 0) or 0)
+
+        if reference_price <= 0:
+            return
+
+        for side in ("buy", "sell"):
+            side_data = final_analysis.get(side) or {}
+
+            if not side_data.get("reversal_confirmed"):
+                continue
+
+            reversal_side_data = dict(side_data)
+            reversal_side_data["confirmation_type"] = "REVERSAL"
+
+            synthetic_candidate = {
+                "symbol": symbol,
+                "signal": side.upper(),
+                "analysis": {side: reversal_side_data},
+                "market_context": {},
+                "rank_score": side_data.get("reversal_uncapped_score_index", 0),
+            }
+
+            register_signal_outcome(synthetic_candidate, reference_price)
+    except Exception as exc:
+        log_warning(
+            f"{symbol} reversal confirmation shadow registration error: {exc}"
+        )
+
+
 def process_ranked_entry_candidates(
     candidates,
     trade_state,
@@ -10278,6 +10323,12 @@ def finalize_scanned_symbol(
         )
     except Exception as e:
         log_warning(f"{symbol} volume profile telemetry error: {e}")
+
+    _register_reversal_confirmation_shadow_outcomes(
+        symbol,
+        final_analysis,
+        entry_df,
+    )
 
     signal = final_analysis["signal"]
 
