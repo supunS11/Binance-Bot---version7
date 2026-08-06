@@ -1,6 +1,7 @@
 import signal
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import config
@@ -10295,6 +10296,84 @@ def process_ranked_entry_candidates(
     return position_details, open_positions
 
 
+def scan_symbol_worker(symbol, btc_trend_df, btc_trend):
+    """Runs inside the scan thread pool: fetch klines + score one symbol.
+
+    Must not mutate any shared state (position_details/open_positions/
+    trade_state/signal_candidates) - returns a result dict for the main
+    thread to hand to finalize_scanned_symbol sequentially afterward.
+    Returns None if the symbol should be skipped this cycle.
+    """
+    log_info(f"Checking {symbol}")
+
+    trend_df, confirm_df, entry_df = get_signal_frames(symbol, btc_trend_df)
+
+    if trend_df is None or confirm_df is None or entry_df is None:
+        return None
+
+    breadth_sample = build_breadth_sample(symbol, trend_df)
+
+    latest_entry_candle = entry_df.iloc[-2]
+    observe_signal_outcomes(
+        symbol,
+        latest_entry_candle.get("close"),
+        latest_entry_candle.get("high"),
+        latest_entry_candle.get("low"),
+    )
+
+    btc_corr, rs = calculate_btc_context(symbol, trend_df, btc_trend_df)
+    log_info(f"{symbol} BTC CORR: {btc_corr}")
+    log_info(f"{symbol} RS: {rs}%")
+
+    base_analysis = analyze_signal_cached(
+        trend_df,
+        confirm_df,
+        entry_df,
+        btc_trend,
+        btc_corr,
+        rs,
+        log_details=False,
+        cache_namespace=symbol,
+    )
+    scan_item = {
+        "symbol": symbol,
+        "analysis": base_analysis,
+        "participation": None,
+        "trend_df": trend_df,
+        "confirm_df": confirm_df,
+        "entry_df": entry_df,
+        "btc_trend": btc_trend,
+        "btc_corr": btc_corr,
+        "rs": rs,
+    }
+
+    if should_fetch_futures_context(base_analysis):
+        scan_item["futures_priority"] = futures_context_priority(base_analysis)
+
+    return {"scan_item": scan_item, "breadth_sample": breadth_sample}
+
+
+def futures_context_worker(scan_item):
+    """Runs inside the futures-context thread pool: fetch participation
+    data + re-analyze one already-scanned symbol. Must not mutate any
+    shared state - returns (participation, analysis) for the main thread
+    to hand to finalize_scanned_symbol sequentially afterward.
+    """
+    symbol = scan_item["symbol"]
+    participation = get_futures_participation(symbol) or {}
+    analysis = analyze_signal(
+        scan_item["trend_df"],
+        scan_item["confirm_df"],
+        scan_item["entry_df"],
+        scan_item["btc_trend"],
+        scan_item["btc_corr"],
+        scan_item["rs"],
+        participation=participation,
+        log_details=False
+    )
+    return participation, analysis
+
+
 def finalize_scanned_symbol(
     scan_item,
     signal_candidates,
@@ -10422,7 +10501,7 @@ def run_bot():
     log_info(
         f"Scanning {len(scan_symbols)} symbols | "
         f"KLINE_LIMIT={config.KLINE_LIMIT} | "
-        f"THROTTLE={config.REQUEST_THROTTLE_SECONDS}s"
+        f"SCAN_CONCURRENCY={config.SCAN_CONCURRENCY}"
     )
     log_active_dca_config()
 
@@ -10676,89 +10755,86 @@ def run_bot():
                 breadth_samples = []
                 begin_llm_scan_budget()
 
-                for symbol in scan_symbols:
+                open_position_symbols = [
+                    symbol for symbol in scan_symbols if symbol in open_positions
+                ]
+                scan_targets = [
+                    symbol
+                    for symbol in scan_symbols
+                    if symbol not in open_positions
+                ]
+
+                # Already-open positions are cheap (no kline fetch) and can
+                # touch trade_state via run_scan_dca_check - keep sequential.
+                for symbol in open_position_symbols:
                     if shutdown_event.is_set():
                         log_warning("Scan stopped | bot shutdown requested")
                         break
 
                     try:
                         log_info(f"Checking {symbol}")
-
-                        if symbol in open_positions:
-                            open_mark_price = (
-                                position_details.get(symbol, {}).get("mark_price")
-                            )
-                            observe_signal_outcomes(
-                                symbol,
-                                open_mark_price,
-                                open_mark_price,
-                                open_mark_price,
-                            )
-                            if symbol not in lifecycle_blocked_symbols:
-                                run_scan_dca_check(
-                                    symbol,
-                                    position_details[symbol],
-                                    btc_trend_df,
-                                    btc_trend,
-                                    dca_monitor=dca_monitor
-                                )
-                            continue
-
-                        trend_df, confirm_df, entry_df = get_signal_frames(
-                            symbol,
-                            btc_trend_df
+                        open_mark_price = (
+                            position_details.get(symbol, {}).get("mark_price")
                         )
-
-                        if trend_df is None or confirm_df is None or entry_df is None:
-                            continue
-
-                        breadth_sample = build_breadth_sample(symbol, trend_df)
-
-                        if breadth_sample:
-                            breadth_samples.append(breadth_sample)
-
-                        latest_entry_candle = entry_df.iloc[-2]
                         observe_signal_outcomes(
                             symbol,
-                            latest_entry_candle.get("close"),
-                            latest_entry_candle.get("high"),
-                            latest_entry_candle.get("low"),
+                            open_mark_price,
+                            open_mark_price,
+                            open_mark_price,
                         )
-
-                        btc_corr, rs = calculate_btc_context(
-                            symbol,
-                            trend_df,
-                            btc_trend_df
-                        )
-                        log_info(f"{symbol} BTC CORR: {btc_corr}")
-                        log_info(f"{symbol} RS: {rs}%")
-
-                        base_analysis = analyze_signal_cached(
-                            trend_df,
-                            confirm_df,
-                            entry_df,
-                            btc_trend,
-                            btc_corr,
-                            rs,
-                            log_details=False,
-                            cache_namespace=symbol,
-                        )
-                        scan_item = {
-                            "symbol": symbol,
-                            "analysis": base_analysis,
-                            "participation": None,
-                            "trend_df": trend_df,
-                            "confirm_df": confirm_df,
-                            "entry_df": entry_df,
-                            "btc_trend": btc_trend,
-                            "btc_corr": btc_corr,
-                            "rs": rs,
-                        }
-
-                        if should_fetch_futures_context(base_analysis):
-                            scan_item["futures_priority"] = (
-                                futures_context_priority(base_analysis)
+                        if symbol not in lifecycle_blocked_symbols:
+                            run_scan_dca_check(
+                                symbol,
+                                position_details[symbol],
+                                btc_trend_df,
+                                btc_trend,
+                                dca_monitor=dca_monitor
                             )
+                    except Exception as e:
+                        log_error(f"{symbol} ERROR: {e}")
+
+                # Remaining symbols need fresh klines + scoring - this is
+                # the REST-heavy part, so it runs concurrently. Pacing and
+                # safety still come entirely from the shared weight-budget
+                # limiter in exchange.py, which is safe for concurrent
+                # callers; only finalize_scanned_symbol (mutates shared
+                # position/trade state) stays sequential on this thread.
+                concurrency = max(int(getattr(config, "SCAN_CONCURRENCY", 8)), 1)
+
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    future_to_symbol = {
+                        pool.submit(
+                            scan_symbol_worker,
+                            symbol,
+                            btc_trend_df,
+                            btc_trend,
+                        ): symbol
+                        for symbol in scan_targets
+                    }
+
+                    for future in as_completed(future_to_symbol):
+                        symbol = future_to_symbol[future]
+
+                        if shutdown_event.is_set():
+                            log_warning("Scan stopped | bot shutdown requested")
+                            pool.shutdown(wait=False, cancel_futures=True)
+                            break
+
+                        try:
+                            result = future.result()
+                        except Exception as e:
+                            log_error(f"{symbol} ERROR: {e}")
+                            continue
+
+                        if result is None:
+                            continue
+
+                        if result["breadth_sample"]:
+                            breadth_samples.append(result["breadth_sample"])
+
+                        scan_item = result["scan_item"]
+
+                        if "futures_priority" in scan_item:
                             futures_context_queue.append(scan_item)
                             log_info(
                                 f"{symbol} FUTURES CONTEXT QUEUED | "
@@ -10766,18 +10842,20 @@ def run_bot():
                             )
                             continue
 
-                        position_details, open_positions = finalize_scanned_symbol(
-                            scan_item,
-                            signal_candidates,
-                            trade_state,
-                            position_details,
-                            open_positions,
-                            btc_trend_df,
-                            dca_monitor
-                        )
-
-                    except Exception as e:
-                        log_error(f"{symbol} ERROR: {e}")
+                        try:
+                            position_details, open_positions = (
+                                finalize_scanned_symbol(
+                                    scan_item,
+                                    signal_candidates,
+                                    trade_state,
+                                    position_details,
+                                    open_positions,
+                                    btc_trend_df,
+                                    dca_monitor
+                                )
+                            )
+                        except Exception as e:
+                            log_error(f"{symbol} ERROR: {e}")
 
                 if futures_context_queue and not shutdown_event.is_set():
                     futures_context_queue.sort(
@@ -10798,10 +10876,94 @@ def run_bot():
                         f"SELECTED={selected_count} | LIMIT={futures_limit}"
                     )
 
-                    for index, scan_item in enumerate(
-                        futures_context_queue,
-                        start=1
-                    ):
+                    indexed_queue = list(
+                        enumerate(futures_context_queue, start=1)
+                    )
+                    enriched_items = [
+                        (index, scan_item)
+                        for index, scan_item in indexed_queue
+                        if index <= futures_limit
+                    ]
+                    skipped_items = [
+                        (index, scan_item)
+                        for index, scan_item in indexed_queue
+                        if index > futures_limit
+                    ]
+                    fc_concurrency = max(
+                        int(getattr(config, "SCAN_CONCURRENCY", 8)),
+                        1
+                    )
+
+                    with ThreadPoolExecutor(
+                        max_workers=fc_concurrency
+                    ) as fc_pool:
+                        future_to_item = {
+                            fc_pool.submit(
+                                futures_context_worker,
+                                scan_item,
+                            ): (index, scan_item)
+                            for index, scan_item in enriched_items
+                        }
+
+                        for future in as_completed(future_to_item):
+                            index, scan_item = future_to_item[future]
+                            symbol = scan_item["symbol"]
+
+                            if shutdown_event.is_set():
+                                log_warning(
+                                    "Futures context ranking stopped | "
+                                    "bot shutdown requested"
+                                )
+                                fc_pool.shutdown(
+                                    wait=False,
+                                    cancel_futures=True,
+                                )
+                                break
+
+                            try:
+                                participation, analysis = future.result()
+                            except Exception as e:
+                                log_error(
+                                    f"{symbol} FUTURES CONTEXT "
+                                    f"PROCESSING ERROR: {e}"
+                                )
+                                continue
+
+                            scan_item["participation"] = participation
+                            scan_item["analysis"] = analysis
+                            log_info(
+                                f"{symbol} FUTURES CONTEXT "
+                                f"RANK={index}/{len(futures_context_queue)} | "
+                                f"PRIORITY={scan_item.get('futures_priority')} | "
+                                f"OI={participation.get('oi_change_pct')}% | "
+                                f"TAKER="
+                                f"{participation.get('taker_buy_sell_ratio')} | "
+                                f"GLOBAL_LS="
+                                f"{participation.get('global_long_short_ratio')} | "
+                                f"TOP_LS="
+                                f"{participation.get('top_long_short_ratio')} | "
+                                f"FUNDING={participation.get('funding_rate')}"
+                            )
+
+                            try:
+                                position_details, open_positions = (
+                                    finalize_scanned_symbol(
+                                        scan_item,
+                                        signal_candidates,
+                                        trade_state,
+                                        position_details,
+                                        open_positions,
+                                        btc_trend_df,
+                                        dca_monitor
+                                    )
+                                )
+                            except Exception as e:
+                                log_error(
+                                    f"{symbol} FUTURES CONTEXT "
+                                    f"PROCESSING ERROR: {e}"
+                                )
+
+                    for index, scan_item in skipped_items:
                         if shutdown_event.is_set():
                             log_warning(
                                 "Futures context ranking stopped | "
@@ -10812,42 +10974,12 @@ def run_bot():
                         symbol = scan_item["symbol"]
 
                         try:
-                            if index <= futures_limit:
-                                participation = (
-                                    get_futures_participation(symbol) or {}
-                                )
-                                scan_item["participation"] = participation
-                                log_info(
-                                    f"{symbol} FUTURES CONTEXT "
-                                    f"RANK={index}/{len(futures_context_queue)} | "
-                                    f"PRIORITY={scan_item.get('futures_priority')} | "
-                                    f"OI={participation.get('oi_change_pct')}% | "
-                                    f"TAKER="
-                                    f"{participation.get('taker_buy_sell_ratio')} | "
-                                    f"GLOBAL_LS="
-                                    f"{participation.get('global_long_short_ratio')} | "
-                                    f"TOP_LS="
-                                    f"{participation.get('top_long_short_ratio')} | "
-                                    f"FUNDING={participation.get('funding_rate')}"
-                                )
-                                scan_item["analysis"] = analyze_signal(
-                                    scan_item["trend_df"],
-                                    scan_item["confirm_df"],
-                                    scan_item["entry_df"],
-                                    scan_item["btc_trend"],
-                                    scan_item["btc_corr"],
-                                    scan_item["rs"],
-                                    participation=participation,
-                                    log_details=False
-                                )
-                            else:
-                                log_warning(
-                                    f"{symbol} FUTURES CONTEXT SKIPPED | "
-                                    f"RANK={index} | "
-                                    f"PRIORITY={scan_item.get('futures_priority')} | "
-                                    f"SCAN LIMIT={futures_limit}"
-                                )
-
+                            log_warning(
+                                f"{symbol} FUTURES CONTEXT SKIPPED | "
+                                f"RANK={index} | "
+                                f"PRIORITY={scan_item.get('futures_priority')} | "
+                                f"SCAN LIMIT={futures_limit}"
+                            )
                             position_details, open_positions = (
                                 finalize_scanned_symbol(
                                     scan_item,

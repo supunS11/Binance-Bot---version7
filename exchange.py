@@ -28,13 +28,11 @@ from execution_telemetry import (
 
 client = Client(config.API_KEY, config.SECRET_KEY, ping=False)
 _exchange_info_cache = None
-_last_kline_request_at = 0.0
 _public_rest_backoff_until = 0.0
 _public_rest_log_times = {}
 _public_request_weights = deque()
 _public_request_lock = threading.Lock()
 _public_rest_lock = threading.Lock()
-_kline_request_lock = threading.Lock()
 _kline_cache = {}
 _kline_cache_lock = threading.RLock()
 _futures_context_cache = {}
@@ -104,21 +102,15 @@ def is_one_way_position_mode():
 
 
 def _throttle_kline_request():
-    global _last_kline_request_at
-
+    # Pacing is entirely delegated to _rate_limit_public_request's
+    # sliding-window weight budget, which is already safe for concurrent
+    # callers (own lock, sleep-and-retry). A flat per-call sleep used to
+    # sit in front of it under a separate lock - that serialized every
+    # kline call across the whole process regardless of thread count,
+    # which defeats concurrent scanning without adding any real safety
+    # beyond what the weight budget already guarantees.
     _raise_if_public_rest_backoff("klines")
-
-    with _kline_request_lock:
-        delay = getattr(config, "REQUEST_THROTTLE_SECONDS", 0)
-
-        if delay > 0:
-            elapsed = time.time() - _last_kline_request_at
-
-            if elapsed < delay:
-                time.sleep(delay - elapsed)
-
-        _rate_limit_public_request(getattr(config, "KLINE_REQUEST_WEIGHT", 2))
-        _last_kline_request_at = time.time()
+    _rate_limit_public_request(getattr(config, "KLINE_REQUEST_WEIGHT", 2))
 
 
 def _rate_limit_public_request(weight=1):

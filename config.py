@@ -54,7 +54,11 @@ ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "1h")
 KLINE_LIMIT = env_int("KLINE_LIMIT", 300)
 SCAN_SLEEP_SECONDS = env_int("SCAN_SLEEP_SECONDS", 900)
 SCAN_WAIT_HEARTBEAT_SECONDS = env_int("SCAN_WAIT_HEARTBEAT_SECONDS", 60)
-REQUEST_THROTTLE_SECONDS = env_float("REQUEST_THROTTLE_SECONDS", 0.08)
+# Bounded worker count for concurrent per-symbol scanning (fetch klines +
+# indicators + score) - pacing/safety still comes entirely from the
+# sliding-window weight budget below, this just controls how many symbols
+# can be in-flight waiting on network I/O at once.
+SCAN_CONCURRENCY = env_int("SCAN_CONCURRENCY", 8)
 BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE = env_float(
     "BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE",
     1800
