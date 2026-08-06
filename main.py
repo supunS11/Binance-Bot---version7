@@ -9366,6 +9366,7 @@ def execute_entry_candidate(
             )
         )
         current_price = entry_df["close"].iloc[-2]
+        guard_info = {}
 
         if timing_rescue_active:
             log_info(
@@ -10111,6 +10112,7 @@ def execute_entry_candidate(
             market_context=candidate.get("market_context"),
             signal_id=signal_id,
             rank_score=candidate.get("rank_score"),
+            guard_context=guard_info,
         )
 
         log_info(
