@@ -541,6 +541,40 @@ ORDER_FLOW_SHADOW_TELEMETRY_MIN_INTERVAL_SECONDS = env_float(
     30
 )
 
+# Observation-only forced-liquidation flow (Binance !forceOrder@arr stream).
+# Same shadow-mode principle as ORDER_FLOW_SHADOW above: no strategy,
+# ranking, or execution effect. Whether heavy liquidation flow predicts a
+# fade or a continuation is unknown up front - LIQUIDATION_SHADOW_OUTCOME_
+# TRACKING_ENABLED registers hypothetical BUY and SELL outcomes after a
+# notable liquidation event so that question can be answered from real
+# forward-return data before this ever becomes a live gate.
+LIQUIDATION_SHADOW_ENABLED = env_bool("LIQUIDATION_SHADOW_ENABLED", "True")
+LIQUIDATION_SHADOW_WINDOW_SECONDS = env_int(
+    "LIQUIDATION_SHADOW_WINDOW_SECONDS",
+    1800
+)
+LIQUIDATION_SHADOW_MAX_EVENTS_PER_SYMBOL = env_int(
+    "LIQUIDATION_SHADOW_MAX_EVENTS_PER_SYMBOL",
+    500
+)
+LIQUIDATION_SHADOW_QUEUE_SIZE = env_int("LIQUIDATION_SHADOW_QUEUE_SIZE", 2000)
+LIQUIDATION_SHADOW_OUTCOME_TRACKING_ENABLED = env_bool(
+    "LIQUIDATION_SHADOW_OUTCOME_TRACKING_ENABLED",
+    "True"
+)
+# A liquidation event must have happened within this many seconds of the
+# current scan to trigger a fresh shadow registration - without this, a
+# symbol under sustained liquidation pressure would re-register on every
+# 5-minute scan cycle instead of once per real event.
+LIQUIDATION_SHADOW_RECENT_EVENT_SECONDS = env_int(
+    "LIQUIDATION_SHADOW_RECENT_EVENT_SECONDS",
+    360
+)
+LIQUIDATION_SHADOW_NOTABLE_NOTIONAL_USDT = env_float(
+    "LIQUIDATION_SHADOW_NOTABLE_NOTIONAL_USDT",
+    200000
+)
+
 # Observation-only volume profile (POC/VAH/VAL), logged alongside
 # detect_market_structure's read for comparison. Not imported by strategy.py
 # and does not affect signal ranking, filtering, sizing, or execution -

@@ -84,6 +84,7 @@ from market_intelligence import (
     calculate_regime_transition,
 )
 from order_flow_shadow import OrderFlowShadowMonitor
+from liquidation_shadow import LiquidationShadowMonitor
 from execution_telemetry import (
     flush_execution_telemetry,
     validate_execution_telemetry_path,
@@ -10240,6 +10241,78 @@ def _register_reversal_confirmation_shadow_outcomes(symbol, final_analysis, entr
         )
 
 
+def _register_liquidation_shadow_outcomes(
+    symbol, entry_df, liquidation_shadow_monitor
+):
+    # Whether heavy liquidation flow means "capitulation, fade it" or
+    # "confirms the move, follow it" is genuinely unknown - so this
+    # registers BOTH a hypothetical BUY and a hypothetical SELL outcome
+    # and lets real forward-return data (queried later by route + side)
+    # answer the question, rather than assuming a direction up front.
+    if not getattr(config, "LIQUIDATION_SHADOW_OUTCOME_TRACKING_ENABLED", True):
+        return
+
+    if liquidation_shadow_monitor is None:
+        return
+
+    try:
+        snapshot = liquidation_shadow_monitor.snapshot(symbol)
+
+        if not snapshot or not snapshot.get("available"):
+            return
+
+        last_event_age = snapshot.get("last_event_age_seconds")
+        recent_cutoff = float(
+            getattr(config, "LIQUIDATION_SHADOW_RECENT_EVENT_SECONDS", 360)
+        )
+
+        # Only register on a freshly-arrived event, not every scan cycle a
+        # symbol happens to still be inside the rolling window for.
+        if last_event_age is None or last_event_age > recent_cutoff:
+            return
+
+        notable_notional = float(
+            getattr(config, "LIQUIDATION_SHADOW_NOTABLE_NOTIONAL_USDT", 200000)
+        )
+        net_notional = float(snapshot.get("net_liquidation_notional") or 0)
+
+        if abs(net_notional) < notable_notional:
+            return
+
+        if entry_df is None or len(entry_df) < 2:
+            return
+
+        reference_price = float(entry_df.iloc[-2].get("close", 0) or 0)
+
+        if reference_price <= 0:
+            return
+
+        direction = (
+            "LIQUIDATION_SHADOW_LONG_FLUSH"
+            if net_notional > 0
+            else "LIQUIDATION_SHADOW_SHORT_SQUEEZE"
+        )
+
+        for side in ("BUY", "SELL"):
+            synthetic_candidate = {
+                "symbol": symbol,
+                "signal": side,
+                "analysis": {
+                    side.lower(): {
+                        "confirmation_type": direction,
+                        "score": 0,
+                        "uncapped_score_index": net_notional,
+                    }
+                },
+                "market_context": {},
+                "rank_score": net_notional,
+            }
+
+            register_signal_outcome(synthetic_candidate, reference_price)
+    except Exception as exc:
+        log_warning(f"{symbol} liquidation shadow registration error: {exc}")
+
+
 def process_ranked_entry_candidates(
     candidates,
     trade_state,
@@ -10381,7 +10454,8 @@ def finalize_scanned_symbol(
     position_details,
     open_positions,
     btc_trend_df,
-    dca_monitor
+    dca_monitor,
+    liquidation_shadow_monitor=None
 ):
     symbol = scan_item["symbol"]
     final_analysis = scan_item["analysis"]
@@ -10409,6 +10483,11 @@ def finalize_scanned_symbol(
         symbol,
         final_analysis,
         entry_df,
+    )
+    _register_liquidation_shadow_outcomes(
+        symbol,
+        entry_df,
+        liquidation_shadow_monitor,
     )
 
     signal = final_analysis["signal"]
@@ -10519,6 +10598,7 @@ def run_bot():
     dca_monitor = None
     flow_monitor = None
     shadow_flow_monitor = None
+    liquidation_shadow_monitor = None
     target_margin_monitor = None
 
     try:
@@ -10543,6 +10623,24 @@ def run_bot():
                         f"{cleanup_exc}"
                     )
             shadow_flow_monitor = None
+
+        try:
+            liquidation_shadow_monitor = LiquidationShadowMonitor(
+                scan_symbols,
+                shutdown_event=shutdown_event,
+            )
+            liquidation_shadow_monitor.start()
+        except Exception as exc:
+            log_warning(f"Liquidation shadow startup warning: {exc}")
+            if liquidation_shadow_monitor is not None:
+                try:
+                    liquidation_shadow_monitor.stop()
+                except Exception as cleanup_exc:
+                    log_warning(
+                        "Liquidation shadow partial-start cleanup warning: "
+                        f"{cleanup_exc}"
+                    )
+            liquidation_shadow_monitor = None
 
         flow_monitor = MarketFlowMonitor(
             scan_symbols,
@@ -10851,7 +10949,8 @@ def run_bot():
                                     position_details,
                                     open_positions,
                                     btc_trend_df,
-                                    dca_monitor
+                                    dca_monitor,
+                                    liquidation_shadow_monitor
                                 )
                             )
                         except Exception as e:
@@ -10954,7 +11053,8 @@ def run_bot():
                                         position_details,
                                         open_positions,
                                         btc_trend_df,
-                                        dca_monitor
+                                        dca_monitor,
+                                        liquidation_shadow_monitor
                                     )
                                 )
                             except Exception as e:
@@ -10988,7 +11088,8 @@ def run_bot():
                                     position_details,
                                     open_positions,
                                     btc_trend_df,
-                                    dca_monitor
+                                    dca_monitor,
+                                    liquidation_shadow_monitor
                                 )
                             )
                         except Exception as e:
@@ -11054,6 +11155,7 @@ def run_bot():
             (target_margin_monitor, "target margin monitor"),
             (flow_monitor, "market-flow monitor"),
             (shadow_flow_monitor, "shadow order-flow monitor"),
+            (liquidation_shadow_monitor, "liquidation shadow monitor"),
             (dca_monitor, "DCA monitor"),
         ):
             if monitor is None:
