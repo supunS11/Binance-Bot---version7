@@ -8921,6 +8921,46 @@ def regime_transition_hard_veto(candidate):
     return blocked, reason
 
 
+def order_flow_rescue_veto(candidate):
+    # _module_gates_check (strategy.py) lets a candidate through when it
+    # misses ONLY confirm_score/entry_score by a small margin (see
+    # CONFIRM_SCORE_RESCUE_MARGIN / ENTRY_SCORE_RESCUE_MARGIN), tagging it
+    # order_flow_rescue_pending instead of hard-blocking it - but that pass
+    # is provisional. It still needs real, independent order-flow
+    # confirmation here before it's allowed to actually execute; otherwise
+    # it's blocked, same as if the rescue mechanism didn't exist. This is
+    # the only place the provisional pass gets turned into a real decision,
+    # since market_context (order-book flow data) isn't available yet at
+    # the point _module_gates_check runs.
+    if not getattr(config, "ORDER_FLOW_RESCUE_ENABLED", False):
+        return False, ""
+
+    signal = str(candidate.get("signal") or "").upper()
+    side_data = (candidate.get("analysis") or {}).get(signal.lower(), {}) or {}
+
+    if not side_data.get("order_flow_rescue_pending"):
+        return False, ""
+
+    flow = (candidate.get("market_context") or {}).get("flow") or {}
+
+    if not flow.get("available"):
+        return True, "ORDER_FLOW_RESCUE_DATA_UNAVAILABLE"
+
+    side_key = signal.lower()
+    score = _safe_float(flow.get(f"{side_key}_score"))
+    min_score = _safe_float(
+        getattr(config, "ORDER_FLOW_RESCUE_MIN_FLOW_SCORE", 1.5),
+        1.5,
+    )
+    blocked = score < min_score
+    reason = (
+        f"ORDER_FLOW_RESCUE_NOT_CONFIRMED SCORE={score} < {min_score}"
+        if blocked
+        else ""
+    )
+    return blocked, reason
+
+
 def get_candidate_signal_type(candidate):
     signal = candidate.get("signal")
     analysis = candidate.get("analysis") or {}
@@ -9223,6 +9263,28 @@ def execute_entry_candidate(
                 rs,
                 action="SKIPPED_REGIME_TRANSITION",
                 skip_reason=transition_reason,
+                news_context=news_context,
+                llm_context=llm_context,
+                market_context=candidate.get("market_context"),
+            )
+            return position_details, open_positions, False
+
+        rescue_blocked, rescue_reason = order_flow_rescue_veto(candidate)
+
+        if rescue_blocked:
+            log_warning(f"{symbol} ENTRY BLOCKED | {rescue_reason}")
+            append_signal_journal(
+                symbol,
+                final_analysis,
+                participation,
+                trend_df,
+                confirm_df,
+                entry_df,
+                btc_trend,
+                btc_corr,
+                rs,
+                action="SKIPPED_ORDER_FLOW_RESCUE",
+                skip_reason=rescue_reason,
                 news_context=news_context,
                 llm_context=llm_context,
                 market_context=candidate.get("market_context"),

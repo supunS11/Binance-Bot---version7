@@ -779,6 +779,7 @@ def _live_entry_timeframe_check(side, df, mark_price, label, confidence=None):
             "ema20": None,
             "ema_distance_pct": 0,
             "ema_chase_atr": 0,
+            "structure_break_distance_atr": 0,
             "close_position": 0,
             "body_atr": 0,
             "support_score": 0,
@@ -832,6 +833,12 @@ def _live_entry_timeframe_check(side, df, mark_price, label, confidence=None):
     if side == "BUY":
         recent_low = float(previous["low"].min())
         structure_break = mark_price < recent_low - structure_buffer
+        # Negative = still-safe margin above the break line; positive =
+        # already broken, and by how much, in ATR units (same scale as
+        # ema_chase_atr) - lets a near-miss be told apart from a wide one.
+        structure_break_distance_atr = (
+            (recent_low - structure_buffer - mark_price) / atr
+        )
         opposite_reversal = (
             _is_bearish(latest)
             and body_atr >= min_body_atr
@@ -860,6 +867,9 @@ def _live_entry_timeframe_check(side, df, mark_price, label, confidence=None):
     else:
         recent_high = float(previous["high"].max())
         structure_break = mark_price > recent_high + structure_buffer
+        structure_break_distance_atr = (
+            (mark_price - (recent_high + structure_buffer)) / atr
+        )
         opposite_reversal = (
             _is_bullish(latest)
             and body_atr >= min_body_atr
@@ -917,6 +927,9 @@ def _live_entry_timeframe_check(side, df, mark_price, label, confidence=None):
         "ema20": round(float(ema20), 8) if ema20 else None,
         "ema_distance_pct": round(float(ema_distance_pct), 3),
         "ema_chase_atr": round(float(ema_chase_atr), 2),
+        "structure_break_distance_atr": round(
+            float(structure_break_distance_atr), 3
+        ),
         "close_position": round(float(close_position), 2),
         "body_atr": round(float(body_atr), 2),
         "support_score": round(float(support_score), 2),
@@ -2681,25 +2694,74 @@ def _module_gates_check(
     regime_score
 ):
     if not getattr(config, "SIGNAL_MODULE_GATES_ENABLED", True):
-        return True, []
+        return True, [], False
+
+    # Evidence (2026-08): confirm_score and entry_score are the two biggest
+    # NO_SIGNAL bottlenecks, but the candidates failing them fail by a wide
+    # margin, not a hair's breadth - lowering the thresholds outright would
+    # be a real quality cut, not a free lever. Instead, a candidate that
+    # misses ONLY one of these two gates by a small, configured margin is
+    # let through provisionally (order_flow_rescue_pending=True) rather
+    # than hard-blocked - main.py's order_flow_rescue_veto then requires
+    # real, independent order-flow confirmation before it can actually
+    # execute. TREND/QUALITY/REGIME never get this treatment: those gates
+    # showed no comparable near-miss evidence, so failing them stays a hard
+    # block.
+    rescue_enabled = bool(getattr(config, "ORDER_FLOW_RESCUE_ENABLED", False))
+    confirm_margin = (
+        get_config_float("CONFIRM_SCORE_RESCUE_MARGIN", 0.5)
+        if rescue_enabled
+        else 0
+    )
+    entry_margin = (
+        get_config_float("ENTRY_SCORE_RESCUE_MARGIN", 0.5)
+        if rescue_enabled
+        else 0
+    )
 
     checks = (
-        ("TREND", trend_score, get_config_float("SIGNAL_MIN_TREND_SCORE", 7)),
-        ("CONFIRM", confirm_score, get_config_float("SIGNAL_MIN_CONFIRM_SCORE", 7)),
-        ("ENTRY", entry_score, get_config_float("SIGNAL_MIN_ENTRY_SCORE", 4)),
-        ("QUALITY", quality_score, get_config_float("SIGNAL_MIN_QUALITY_SCORE", 0)),
-        ("REGIME", regime_score, get_config_float("SIGNAL_MIN_REGIME_SCORE", -1.5)),
+        ("TREND", trend_score, get_config_float("SIGNAL_MIN_TREND_SCORE", 7), 0),
+        (
+            "CONFIRM",
+            confirm_score,
+            get_config_float("SIGNAL_MIN_CONFIRM_SCORE", 7),
+            confirm_margin,
+        ),
+        (
+            "ENTRY",
+            entry_score,
+            get_config_float("SIGNAL_MIN_ENTRY_SCORE", 4),
+            entry_margin,
+        ),
+        ("QUALITY", quality_score, get_config_float("SIGNAL_MIN_QUALITY_SCORE", 0), 0),
+        (
+            "REGIME",
+            regime_score,
+            get_config_float("SIGNAL_MIN_REGIME_SCORE", -1.5),
+            0,
+        ),
     )
     failures = []
+    rescue_reasons = []
 
-    for label, value, minimum in checks:
+    for label, value, minimum, rescue_margin in checks:
         value = _safe_float(value)
         minimum = _safe_float(minimum)
 
-        if value < minimum:
-            failures.append(f"{label}={round(value, 2)} < {minimum}")
+        if value >= minimum:
+            continue
 
-    return not failures, failures
+        reason = f"{label}={round(value, 2)} < {minimum}"
+
+        if rescue_margin > 0 and value >= minimum - rescue_margin:
+            rescue_reasons.append(reason)
+        else:
+            failures.append(reason)
+
+    if failures:
+        return False, failures + rescue_reasons, False
+
+    return True, rescue_reasons, bool(rescue_reasons)
 
 
 def _trend_timing_rescue_context(
@@ -4681,12 +4743,14 @@ def _side_signal_score(
         float(entry_quality.get("score", 0)),
         2
     )
-    module_gates_ok, module_gate_reasons = _module_gates_check(
-        trend_score,
-        confirm_score,
-        entry_score,
-        quality_score,
-        regime_score
+    module_gates_ok, module_gate_reasons, order_flow_rescue_pending = (
+        _module_gates_check(
+            trend_score,
+            confirm_score,
+            entry_score,
+            quality_score,
+            regime_score
+        )
     )
     level_check_disabled = bool(level.get("level_check_disabled")) if level else False
     level_score = 4 if level_ok and not level_check_disabled else 0
@@ -4865,6 +4929,7 @@ def _side_signal_score(
         "level_ok": level_ok,
         "module_gates_ok": module_gates_ok,
         "module_gate_reasons": module_gate_reasons,
+        "order_flow_rescue_pending": order_flow_rescue_pending,
         "level": level,
         "ema_distance": ema_distance,
     }

@@ -1160,6 +1160,24 @@ SIGNAL_MIN_CONFIRM_SCORE = env_float("SIGNAL_MIN_CONFIRM_SCORE", 7.5)
 SIGNAL_MIN_ENTRY_SCORE = env_float("SIGNAL_MIN_ENTRY_SCORE", 4.25)
 SIGNAL_MIN_QUALITY_SCORE = env_float("SIGNAL_MIN_QUALITY_SCORE", 0.25)
 SIGNAL_MIN_REGIME_SCORE = env_float("SIGNAL_MIN_REGIME_SCORE", -1.25)
+
+# Evidence (2026-08): confirm_score/entry_score are the two biggest
+# NO_SIGNAL bottlenecks, but the candidates failing them fail by a wide
+# margin - lowering the thresholds outright would be a real quality cut.
+# Instead, a candidate missing ONLY one of these two gates by a small
+# margin is let through provisionally, then main.py's order_flow_rescue_
+# veto requires real, independent live order-flow confirmation
+# (MarketFlowMonitor) before it can actually execute - unproven evidence,
+# unlike the other thresholds in this session, so track rescued trades
+# separately in the journal and watch their real outcomes.
+ORDER_FLOW_RESCUE_ENABLED = env_bool("ORDER_FLOW_RESCUE_ENABLED", "False")
+CONFIRM_SCORE_RESCUE_MARGIN = env_float("CONFIRM_SCORE_RESCUE_MARGIN", 0.5)
+ENTRY_SCORE_RESCUE_MARGIN = env_float("ENTRY_SCORE_RESCUE_MARGIN", 0.5)
+ORDER_FLOW_RESCUE_MIN_FLOW_SCORE = env_float(
+    "ORDER_FLOW_RESCUE_MIN_FLOW_SCORE",
+    1.5
+)
+
 TREND_TIMING_RESCUE_ENABLED = env_bool(
     "TREND_TIMING_RESCUE_ENABLED",
     "True"

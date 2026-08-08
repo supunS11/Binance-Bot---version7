@@ -37,6 +37,8 @@ FIELDNAMES = [
     "sell_participation_score",
     "buy_quality_score",
     "sell_quality_score",
+    "buy_order_flow_rescue_pending",
+    "sell_order_flow_rescue_pending",
     "buy_regime_score",
     "sell_regime_score",
     "buy_regime",
@@ -126,6 +128,10 @@ FIELDNAMES = [
     "live_guard_slow_ema_wrong_side",
     "live_guard_fast_support_score",
     "live_guard_slow_support_score",
+    "live_guard_fast_ema_distance_pct",
+    "live_guard_slow_ema_distance_pct",
+    "live_guard_fast_structure_break_distance_atr",
+    "live_guard_slow_structure_break_distance_atr",
 ]
 
 
@@ -298,6 +304,16 @@ def append_signal_journal(
             "sell_participation_score": _side_value(sell, "participation_score"),
             "buy_quality_score": _side_value(buy, "quality_score"),
             "sell_quality_score": _side_value(sell, "quality_score"),
+            "buy_order_flow_rescue_pending": _side_value(
+                buy,
+                "order_flow_rescue_pending",
+                False
+            ),
+            "sell_order_flow_rescue_pending": _side_value(
+                sell,
+                "order_flow_rescue_pending",
+                False
+            ),
             "buy_regime_score": _side_value(buy, "regime_score"),
             "sell_regime_score": _side_value(sell, "regime_score"),
             "buy_regime": _nested_value(buy, "regime_context", "regime"),
@@ -428,6 +444,18 @@ def append_signal_journal(
             "live_guard_slow_ema_wrong_side": guard_slow.get("ema_wrong_side", ""),
             "live_guard_fast_support_score": guard_fast.get("support_score", ""),
             "live_guard_slow_support_score": guard_slow.get("support_score", ""),
+            "live_guard_fast_ema_distance_pct": guard_fast.get(
+                "ema_distance_pct", ""
+            ),
+            "live_guard_slow_ema_distance_pct": guard_slow.get(
+                "ema_distance_pct", ""
+            ),
+            "live_guard_fast_structure_break_distance_atr": guard_fast.get(
+                "structure_break_distance_atr", ""
+            ),
+            "live_guard_slow_structure_break_distance_atr": guard_slow.get(
+                "structure_break_distance_atr", ""
+            ),
         }
 
         with path.open("a", newline="", encoding="utf-8") as file:
